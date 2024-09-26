@@ -14,7 +14,6 @@ import (
 	"k8s.io/client-go/rest"
 
 	"github.com/keel-hq/keel/approvals"
-	"github.com/keel-hq/keel/bot"
 
 	// "github.com/keel-hq/keel/cache/memory"
 	"github.com/keel-hq/keel/pkg/auth"
@@ -241,8 +240,6 @@ func main() {
 		uiDir:            *uiDir,
 	})
 
-	bot.Run(implementer, approvalsManager)
-
 	signalChan := make(chan os.Signal, 1)
 	cleanupDone := make(chan bool)
 	signal.Notify(signalChan, os.Interrupt)
@@ -262,7 +259,6 @@ func main() {
 				}()
 				providers.Stop()
 				teardownTriggers()
-				bot.Stop()
 
 				cleanupDone <- true
 			}
