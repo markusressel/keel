@@ -11,3 +11,18 @@ updates:
     directory: "/" # Location of package manifests
     schedule:
       interval: "daily"
+  # Fetch and update latest `npm` packages
+  - package-ecosystem: npm
+    directory: '/ui'
+    schedule:
+      interval: daily
+      time: '00:00'
+    open-pull-requests-limit: 10
+    reviewers:
+      - markusressel
+    assignees:
+      - markusressel
+    commit-message:
+      prefix: fix
+      prefix-development: chore
+      include: scope
