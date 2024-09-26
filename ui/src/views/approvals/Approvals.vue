@@ -223,18 +223,18 @@ export default {
       if (this.filter === '') {
         return this.approvals
       }
-      const filter = this.filter
+      const filter = this.filter.toLowerCase()
       return this.approvals.reduce(function (filtered, approval) {
-        if (approval.identifier.includes(filter)) {
+        if (approval.identifier.toLowerCase().includes(filter)) {
           filtered.push(approval)
           return filtered
-        } else if (approval.provider.includes(filter)) {
+        } else if (approval.provider.toLowerCase().includes(filter)) {
           filtered.push(approval)
           return filtered
-        } else if (approval.message.includes(filter)) {
+        } else if (approval.message.toLowerCase().includes(filter)) {
           filtered.push(approval)
           return filtered
-        } else if (approval.createdAt.includes(filter)) {
+        } else if (approval.createdAt.toLowerCase().includes(filter)) {
           filtered.push(approval)
           return filtered
         }
