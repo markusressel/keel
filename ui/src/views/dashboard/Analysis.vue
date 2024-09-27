@@ -85,7 +85,7 @@
 
     <!-- <a-row :gutter="24"> -->
     <a-card
-      style="margin-top: 24px margin-bot: 24px"
+      style="margin-top: 24px; margin-bot: 24px"
       :bordered="false"
       title="Kubernetes Cluster Resources">
 
@@ -513,7 +513,6 @@ export default {
 
   .antd-pro-pages-dashboard-analysis-twoColLayout {
     position: relative;
-    display: flex;
     display: block;
     flex-flow: row wrap;
 
