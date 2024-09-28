@@ -46,11 +46,15 @@ security (through dependency updates) and maintainability.
 
 ### Removed Features
 
+- Bots
+    - All of the Bots have been removed from this project.
+      The reason for this is that supporting them is out of scope for me and the REST API and webhooks makes it easy to
+      provide them using third party containers. This makes it possible to share the maintenance burden with the community.
+      Check out my own Telegram specific bot: [keel-telegram-bot](https://github.com/markusressel/keel-telegram-bot)
 - Notification Providers
     - All of Notification Providers except the Webhook one have been removed from this project.
       The reason for this is that supporting them is out of scope for me and the webhook integration makes it easy to
-      provide them using third party containers.
-      I am doing the exact same thing for telegram using my [keel-telegram-bot](https://github.com/markusressel/keel-telegram-bot) project.
+      provide them using third party containers. Check out my Telegram specific one here: [keel-telegram-bot](https://github.com/markusressel/keel-telegram-bot)
 - Helm Provider
     - While I have not yet removed the support for Helm, I am not using it myself and might remove support for it in the
       future.
