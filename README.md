@@ -39,7 +39,7 @@ security (through dependency updates) and maintainability.
 ### Canged Features
 
 - API
-    - While the REST API of the original project is still there, it might be extended in the future.
+    - The REST API of the original project is currently unchanged, but might be extended in the future.
     - Since I do not intend to support a ton of external services like Slack or Discord, this API is the main
       way to interact with Keel and come up with your own service to provide bots and notifications. If you
       would like to create such a service, take a look at the [keel-telegram-bot](https://github.com/markusressel/keel-telegram-bot) project.
