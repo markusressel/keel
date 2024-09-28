@@ -11,7 +11,7 @@
 # Fork Disclaimer
 
 This is a fork of the original Keel project. The original project can be found [here](https://github.com/keel-hq/keel).
-This fork is intended to provide a more stable and feature rich version of Keel, since the original
+This fork is intended to provide a more up-2-date and possibly more feature rich version of Keel, since the original
 project seems to have been abandoned a long time ago. To be able to do that the scope of the project has
 been limited slightly by removing some features as described below.
 
