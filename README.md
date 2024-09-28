@@ -40,6 +40,9 @@ security (through dependency updates) and maintainability.
 
 - API
     - While the REST API of the original project is still there, it might be extended in the future.
+    - Since I do not intend to support a ton of external services like Slack or Discord, this API is the main
+      way to interact with Keel and come up with your own service to provide bots and notifications. If you
+      would like to create such a service, take a look at the [keel-telegram-bot](https://github.com/markusressel/keel-telegram-bot) project.
 
 ### Removed Features
 
@@ -47,7 +50,7 @@ security (through dependency updates) and maintainability.
     - All of Notification Providers except the Webhook one have been removed from this project.
       The reason for this is that supporting them is out of scope for me and the webhook integration makes it easy to
       provide them using third party containers.
-      I am doing the exact same thing for telegram using my [keel-telegram-bot]() project.
+      I am doing the exact same thing for telegram using my [keel-telegram-bot](https://github.com/markusressel/keel-telegram-bot) project.
 - Helm Provider
     - While I have not yet removed the support for Helm, I am not using it myself and might remove support for it in the
       future.
@@ -156,7 +159,7 @@ To test Keel while developing:
 4. Start Keel with: `keel --no-incluster`. This will use Kubeconfig from your home.
 
 ```bash
-sudo docker run -t --rm --name keel-markus keelhq/keel:alpha1
+sudo docker run -t --rm --name keel ghcr.io/markusressel/keel:latest
 ```
 
 ### Running unit tests
