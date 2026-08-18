@@ -94,7 +94,7 @@ func (s *TriggerServer) Start() error {
 	n.UseHandler(s.router)
 
 	s.server = &http.Server{
-		Addr:    fmt.Sprintf(":%d", s.port),
+		Addr:    fmt.Sprintf("0.0.0.0:%d", s.port),
 		Handler: n,
 	}
 

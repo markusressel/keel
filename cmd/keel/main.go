@@ -337,9 +337,18 @@ type TriggerOpts struct {
 // func setupTriggers(ctx context.Context, providers provider.Providers, approvalsManager approvals.Manager, grc *k8s.GenericResourceCache, k8sClient kubernetes.Implementer) (teardown func()) {
 func setupTriggers(ctx context.Context, opts *TriggerOpts) (teardown func()) {
 
+	_username := os.Getenv(constants.EnvBasicAuthUser)
+	if _username == "" {
+		_username = "admin"
+	}
+	_password := os.Getenv(constants.EnvBasicAuthPassword)
+	if _password == "" {
+		_password = "admin"
+	}
+
 	authenticator := auth.New(&auth.Opts{
-		Username: os.Getenv(constants.EnvBasicAuthUser),
-		Password: os.Getenv(constants.EnvBasicAuthPassword),
+		Username: _username,
+		Password: _password,
 		Secret:   []byte(os.Getenv(constants.EnvTokenSecret)),
 	})
 

@@ -69,6 +69,8 @@ Keel provides several key features:
 * __[Kubernetes](https://kubernetes.io/) and [Helm](https://helm.sh) providers__ - Keel has direct integrations with
   Kubernetes and Helm.
 
+* __REST API__ - Keel provides a REST API for other services to integrate with it, like f.ex. bots or other external interfaces.
+
 * __No CLI/API__ - tired of `f***ctl` for everything? Keel doesn't have one. Gets job done through labels, annotations,
   charts.
 
@@ -83,8 +85,8 @@ Keel provides several key features:
 * __[Polling](https://keel.sh/docs/#polling)__ - when webhooks and pubsub aren't available - Keel can still be useful by
   checking Docker Registry for new tags (if current tag is semver) or same tag SHA digest change (ie: `latest`).
 
-* __Notifications__ - out of the box Keel has Slack, Hipchat, Mattermost and standard webhook notifications, more
-  info [here](https://keel.sh/docs/#notifications)
+* __Notifications__ - out of the box this Fork has standard webhook support. More sophisticated notifications
+  can be provided by third party services integrating with the REST API.
 
 <p align="center">
   <a href="https://keel.sh" target="_blank"><img width="700"src="https://keel.sh/img/keel_high_level.png"></a>
@@ -99,6 +101,15 @@ Keel provides several key features:
 A step-by-step guide to install Keel on your Kubernetes cluster is viewable on the Keel website:
 
 [https://keel.sh/examples/#example-1-push-to-deploy](https://keel.sh/examples/#example-1-push-to-deploy)
+
+### Docker
+
+This repository currently only provides a Docker container
+
+```bash
+sudo docker run -t --rm --name keel ghcr.io/markusressel/keel:latest
+```
+
 
 ### Configuration
 
@@ -161,10 +172,6 @@ To test Keel while developing:
 2. Change config to use it: `kubectl config use-context docker-for-desktop`
 3. Build Keel from `cmd/keel` directory.
 4. Start Keel with: `keel --no-incluster`. This will use Kubeconfig from your home.
-
-```bash
-sudo docker run -t --rm --name keel ghcr.io/markusressel/keel:latest
-```
 
 ### Running unit tests
 
