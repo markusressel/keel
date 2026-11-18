@@ -2,12 +2,10 @@ package poll
 
 import (
 	"errors"
-	"reflect"
 	"strconv"
 	"strings"
 	"testing"
 
-	"github.com/Masterminds/semver"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/keel-hq/keel/approvals"
@@ -74,8 +72,9 @@ func testRunHelper(testCases []runTestCase, availableTags []string, t *testing.T
 	for _, testCase := range testCases {
 		reference, _ := image.Parse("foo/bar:" + testCase.currentTag)
 		testImages = append(testImages, &types.TrackedImage{
-			Image:  reference,
-			Policy: testCase.bumpPolicy,
+			Image:   reference,
+			Trigger: types.TriggerTypePoll,
+			Policy:  testCase.bumpPolicy,
 		})
 	}
 	fp := &fakeProvider{
@@ -116,15 +115,15 @@ func testRunHelper(testCases []runTestCase, availableTags []string, t *testing.T
 		}
 		t.Errorf("expected "+strconv.Itoa(nbEvents)+" events, got: %d [%s]", len(fp.submitted), strings.Join(tags, ", "))
 	} else {
-		for i, testCase := range testCases {
+		for i := 0; i < len(fp.submitted); i++ {
 			submitted := fp.submitted[i]
 
 			if submitted.Repository.Name != "index.docker.io/foo/bar" {
 				t.Errorf("unexpected event repository name: %s", submitted.Repository.Name)
 			}
 
-			if submitted.Repository.Tag != testCase.expectedTag {
-				t.Errorf("expected event repository tag "+testCase.expectedTag+", but got: %s", submitted.Repository.Tag)
+			if submitted.Repository.Tag != testCases[i].expectedTag {
+				t.Errorf("expected event repository tag "+testCases[i].expectedTag+", but got: %s", submitted.Repository.Tag)
 			}
 		}
 	}
@@ -185,6 +184,33 @@ func TestWatchAllTagsMixed(t *testing.T) {
 	testRunHelper(testCases, availableTags, t)
 }
 
+func TestWatchGlobTagsMixed(t *testing.T) {
+	availableTags := []string{"1.3.0-dev", "build-1694132169", "build-1696801785", "build-1695801785"}
+	policy, _ := policy.NewGlobPolicy("glob:build-*")
+	testCases := []runTestCase{
+		{"1.0.0", "build-1696801785", policy},
+	}
+	testRunHelper(testCases, availableTags, t)
+}
+
+func TestWatchRegexpTagsCompareMixed(t *testing.T) {
+	availableTags := []string{"1.3.0-dev", "build-2a3560ef-1694132169", "build-1a3560ef-1696801785", "build-3a3560ef-1695801785"}
+	policy, _ := policy.NewRegexpPolicy("regexp:^build-.*-(?P<compare>.+)$")
+	testCases := []runTestCase{
+		{"1.0.0", "build-1a3560ef-1696801785", policy},
+	}
+	testRunHelper(testCases, availableTags, t)
+}
+
+func TestWatchRegexpTagsMixed(t *testing.T) {
+	availableTags := []string{"1.3.0-dev", "build-2a3560ef-1694132169", "build-1a3560ef-1696801785", "build-3a3560ef-1695801785"}
+	policy, _ := policy.NewRegexpPolicy("regexp:^build-.*$")
+	testCases := []runTestCase{
+		{"1.0.0", "build-3a3560ef-1695801785", policy},
+	}
+	testRunHelper(testCases, availableTags, t)
+}
+
 func TestWatchAllTagsMixedPolicyAll(t *testing.T) {
 	availableTags := []string{"1.3.0-dev", "1.5.0", "1.8.0-alpha"}
 	testCases := []runTestCase{
@@ -193,19 +219,25 @@ func TestWatchAllTagsMixedPolicyAll(t *testing.T) {
 	testRunHelper(testCases, availableTags, t)
 }
 
-func Test_semverSort(t *testing.T) {
-	tags := []string{"1.3.0", "aa1.0.0", "zzz", "1.3.0-dev", "1.5.0", "2.0.0-alpha", "1.3.0-dev1", "1.8.0-alpha", "1.3.1-dev", "123", "1.2.3-rc.1.2+meta"}
-	expectedTags := []string{"2.0.0-alpha", "1.8.0-alpha", "1.5.0", "1.3.1-dev", "1.3.0", "1.3.0-dev1", "1.3.0-dev", "1.2.3-rc.1.2+meta"}
-	expectedVersions := make([]*semver.Version, len(expectedTags))
-	for i, tag := range expectedTags {
-		v, _ := semver.NewVersion(tag)
-		expectedVersions[i] = v
-	}
-	sortedTags := semverSort(tags)
+// Regression test for https://github.com/keel-hq/keel/issues/823: with the
+// force policy, the tag list returned by the registry is in creation order
+// (oldest first), not version order. The oldest tag in the repository must
+// not win: keel has to pick the newest tag that is newer than the current
+// one, and must not downgrade when no newer tag exists.
+func TestWatchAllTagsJobWithForcePolicy(t *testing.T) {
+	availableTags := []string{"3.0.0", "3.0.1", "5.0.0", "7.9.1-1-ubi8", "8.0.0", "8.3.1", "latest"}
 
-	if !reflect.DeepEqual(sortedTags, expectedVersions) {
-		t.Errorf("Invalid sorted tags; expected: %s; got: %s", expectedVersions, sortedTags)
-	}
+	// cp-kafka style: current 7.9.1-1-ubi8 must update to 8.3.1, not 3.0.0
+	testRunHelper([]runTestCase{{"7.9.1-1-ubi8", "8.3.1", policy.NewForcePolicy(false)}}, availableTags, t)
+
+	// already at the newest tag: no event
+	testRunHelper([]runTestCase{{"8.3.1", "8.3.1", policy.NewForcePolicy(false)}}, availableTags, t)
+
+	// 8.1.0 -> 8.0.0 style downgrade must not happen
+	testRunHelper([]runTestCase{{"8.1.0", "8.2.0", policy.NewForcePolicy(false)}}, []string{"8.0.0", "8.1.0", "8.2.0"}, t)
+
+	// no newer tag available: no event, even though older tags exist
+	testRunHelper([]runTestCase{{"7.9.1-1-ubi8", "7.9.1-1-ubi8", policy.NewForcePolicy(false)}}, []string{"3.0.0", "5.0.0"}, t)
 }
 
 type testingCredsHelper struct {
@@ -311,4 +343,91 @@ func TestWatchMultipleTagsWithCredentialsHelper(t *testing.T) {
 		assert.Equal(t, "pass", frc.opts.Password)
 	})
 
+}
+
+func TestWatchTagsAfterCurrent(t *testing.T) {
+	type workload struct {
+		tag   string
+		optIn bool
+	}
+	tests := []struct {
+		name          string
+		workloads     []workload
+		tagsAfter     map[string][]string
+		wantAfters    []string
+		wantSubmitted []string
+	}{
+		{
+			name:          "opted-in workload lists only tags after its current tag",
+			workloads:     []workload{{"1.1.1", true}},
+			tagsAfter:     map[string][]string{"1.1.1": {"pr-9", "1.2.0"}},
+			wantAfters:    []string{"1.1.1"},
+			wantSubmitted: []string{"1.2.0"},
+		},
+		{
+			name:          "related workloads on different tags list after each tag",
+			workloads:     []workload{{"1.1.1", true}, {"1.2.0", true}},
+			tagsAfter:     map[string][]string{"1.1.1": {"1.2.0"}, "1.2.0": {"1.3.0"}},
+			wantAfters:    []string{"1.1.1", "1.2.0"},
+			wantSubmitted: []string{"1.3.0"},
+		},
+		{
+			name:          "related workloads on the same tag list once",
+			workloads:     []workload{{"1.1.1", true}, {"1.1.1", true}},
+			tagsAfter:     map[string][]string{"1.1.1": {"1.2.0"}},
+			wantAfters:    []string{"1.1.1"},
+			wantSubmitted: []string{"1.2.0"},
+		},
+		{
+			name:          "a related workload that did not opt in keeps the full listing",
+			workloads:     []workload{{"1.1.1", true}, {"1.1.1", false}},
+			tagsAfter:     map[string][]string{"1.1.1": {"1.2.0"}},
+			wantAfters:    []string{""},
+			wantSubmitted: []string{"9.9.9"},
+		},
+		{
+			name:          "workload that did not opt in keeps the full listing",
+			workloads:     []workload{{"1.1.1", false}},
+			wantAfters:    []string{""},
+			wantSubmitted: []string{"9.9.9"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var images []*types.TrackedImage
+			for _, w := range tt.workloads {
+				reference, _ := image.Parse("foo/bar:" + w.tag)
+				images = append(images, &types.TrackedImage{
+					Image:                reference,
+					Trigger:              types.TriggerTypePoll,
+					Policy:               policy.NewSemverPolicy(policy.SemverPolicyTypeAll, true),
+					PollTagsAfterCurrent: w.optIn,
+				})
+			}
+			fp := &fakeProvider{images: images}
+			store, teardown := newTestingUtils()
+			defer teardown()
+			providers := provider.New([]provider.Provider{fp}, approvals.New(&approvals.Opts{Store: store}))
+
+			frc := &fakeRegistryClient{
+				tagsToReturn:      []string{"9.9.9"},
+				tagsAfterToReturn: tt.tagsAfter,
+			}
+
+			NewWatchRepositoryTagsJob(providers, frc, &watchDetails{trackedImage: images[0]}).Run()
+
+			var afters []string
+			for _, opts := range frc.getOpts {
+				afters = append(afters, opts.After)
+			}
+			assert.Equal(t, tt.wantAfters, afters)
+
+			var submitted []string
+			for _, e := range fp.submitted {
+				submitted = append(submitted, e.Repository.Tag)
+			}
+			assert.Equal(t, tt.wantSubmitted, submitted)
+		})
+	}
 }

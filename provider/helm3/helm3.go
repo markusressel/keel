@@ -4,10 +4,14 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/keel-hq/keel/approvals"
+	"github.com/keel-hq/keel/internal/concurrent"
+	"github.com/keel-hq/keel/internal/k8s"
 	"github.com/keel-hq/keel/internal/policy"
+	"github.com/keel-hq/keel/pkg/config"
 	"github.com/keel-hq/keel/types"
 	"github.com/keel-hq/keel/util/image"
 
@@ -43,9 +47,35 @@ var helm3UnversionedUpdatesCounter = prometheus.NewCounterVec(
 	[]string{"chart"},
 )
 
+var eventBufferBackpressureCounter = prometheus.NewCounter(
+	prometheus.CounterOpts{
+		Name: "helm3_event_buffer_backpressure_total",
+		Help: "How many times an event submit had to wait because the helm3 provider event buffer was full.",
+	},
+)
+
+// concurrentPlanWorkers bounds how many releases of a single event are
+// updated in parallel. Events stay processed one at a time, but within an
+// event each release update runs independently, so one slow release cannot
+// hold up the others (keel-hq/keel#443).
+const concurrentPlanWorkers = 10
+
+// backpressureLogInterval limits how often a saturated buffer is logged.
+const backpressureLogInterval = 5 * time.Second
+
+// lastBackpressureLogNS is the last time a saturated-buffer warning was
+// logged (unix nanos).
+var lastBackpressureLogNS atomic.Int64
+
+// ErrProviderStopped is returned by Submit when the provider has already
+// stopped, so callers fail fast instead of blocking on a channel nobody
+// drains.
+var ErrProviderStopped = errors.New("provider is stopped")
+
 func init() {
 	prometheus.MustRegister(helm3VersionedUpdatesCounter)
 	prometheus.MustRegister(helm3UnversionedUpdatesCounter)
+	prometheus.MustRegister(eventBufferBackpressureCounter)
 }
 
 // ErrPolicyNotSpecified helm related errors
@@ -82,6 +112,12 @@ type UpdatePlan struct {
 	CurrentVersion string
 	// New version that's already in the deployment
 	NewVersion string
+	// Current digest of the image being replaced, known when the release
+	// workloads report one, empty otherwise
+	CurrentDigest string
+	// New digest taken from the event repository, empty when the trigger
+	// did not provide one
+	NewDigest string
 
 	// ReleaseNotes is a slice of combined release notes.
 	ReleaseNotes []string
@@ -132,7 +168,10 @@ type ImageDetails struct {
 
 // Provider - helm3 provider, responsible for managing release updates
 type Provider struct {
-	implementer Implementer
+	implementer    Implementer
+	platforms      *k8s.PlatformResolver
+	runningDigests *k8s.RunningDigestResolver
+	resources      ResourceCache
 
 	sender notification.Sender
 
@@ -142,15 +181,43 @@ type Provider struct {
 	stop   chan struct{}
 }
 
+// ResourceCache provides the Kubernetes workloads indexed by the shared cache.
+type ResourceCache interface {
+	Values() []*k8s.GenericResource
+}
+
+// ProviderOption configures optional Helm provider integrations.
+type ProviderOption func(*Provider)
+
+// WithWorkloadPlatforms enables Kubernetes-backed platform resolution for Helm images.
+func WithWorkloadPlatforms(platforms *k8s.PlatformResolver, resources ResourceCache) ProviderOption {
+	return func(provider *Provider) {
+		provider.platforms = platforms
+		provider.resources = resources
+	}
+}
+
+// WithRunningDigests enables reporting of the image digests that the release
+// workloads are actually running.
+func WithRunningDigests(runningDigests *k8s.RunningDigestResolver) ProviderOption {
+	return func(provider *Provider) {
+		provider.runningDigests = runningDigests
+	}
+}
+
 // NewProvider - create new Helm provider
-func NewProvider(implementer Implementer, sender notification.Sender, approvalManager approvals.Manager) *Provider {
-	return &Provider{
+func NewProvider(implementer Implementer, sender notification.Sender, approvalManager approvals.Manager, options ...ProviderOption) *Provider {
+	provider := &Provider{
 		implementer:     implementer,
 		approvalManager: approvalManager,
 		sender:          sender,
-		events:          make(chan *types.Event, 100),
+		events:          make(chan *types.Event, config.DefaultEventBufferSize),
 		stop:            make(chan struct{}),
 	}
+	for _, option := range options {
+		option(provider)
+	}
+	return provider
 }
 
 // GetName - get provider name
@@ -158,10 +225,56 @@ func (p *Provider) GetName() string {
 	return ProviderName
 }
 
-// Submit - submit event to provider
+// Submit - submit event to provider. Submit never drops an event: when the
+// buffer is full it applies backpressure (the call blocks) and logs the
+// saturation so a stalled pipeline is visible instead of silently delaying
+// or losing updates.
 func (p *Provider) Submit(event types.Event) error {
-	p.events <- &event
-	return nil
+	select {
+	case <-p.stop:
+		return ErrProviderStopped
+	default:
+	}
+	select {
+	case p.events <- &event:
+		return nil
+	case <-p.stop:
+		return ErrProviderStopped
+	default:
+	}
+
+	// The buffer is full. Retain the event and apply backpressure: wait for
+	// the consumer to drain a slot instead of dropping or delaying the
+	// trigger in silence.
+	eventBufferBackpressureCounter.Inc()
+	logBackpressure(&event, p)
+
+	select {
+	case p.events <- &event:
+		return nil
+	case <-p.stop:
+		return ErrProviderStopped
+	}
+}
+
+func logBackpressure(event *types.Event, p *Provider) {
+	now := time.Now().UnixNano()
+	for {
+		last := lastBackpressureLogNS.Load()
+		if last != 0 && now-last < int64(backpressureLogInterval) {
+			return
+		}
+		if lastBackpressureLogNS.CompareAndSwap(last, now) {
+			log.WithFields(log.Fields{
+				"context":           "provider.helm3",
+				"image":             event.Repository.Name,
+				"tag":               event.Repository.Tag,
+				"trigger":           event.TriggerName,
+				"event_buffer_size": cap(p.events),
+			}).Warn("event buffer saturated; applying backpressure (event retained, not dropped)")
+			return
+		}
+	}
 }
 
 // Start - starts kubernetes provider, waits for events
@@ -228,6 +341,8 @@ func (p *Provider) TrackedImages() ([]*types.TrackedImage, error) {
 			}
 			img.Namespace = release.Namespace
 			img.Provider = ProviderName
+			img.Platforms, img.PlatformErr = p.releaseImagePlatforms(release.Namespace, release.Name, img)
+			img.RunningDigests = p.releaseImageRunningDigests(release.Namespace, release.Name, img)
 			trackedImages = append(trackedImages, img)
 		}
 
@@ -237,6 +352,11 @@ func (p *Provider) TrackedImages() ([]*types.TrackedImage, error) {
 }
 
 func (p *Provider) startInternal() error {
+	log.WithFields(log.Fields{
+		"context":           "provider.helm3",
+		"event_buffer_size": cap(p.events),
+	}).Info("provider.helm3: starting event loop")
+
 	for {
 		select {
 		case event := <-p.events:
@@ -287,6 +407,28 @@ func (p *Provider) createUpdatePlans(event *types.Event) ([]*UpdatePlan, error) 
 		}
 
 		if update {
+			// report the digest the release workloads are currently running
+			// so notifications can show the full image transition
+			if eventRepoRef, parseErr := image.Parse(event.Repository.String()); parseErr == nil {
+				plan.CurrentDigest = p.currentReleaseImageDigest(release.Namespace, release.Name, eventRepoRef.Repository(), plan.CurrentVersion)
+			}
+			if event.Repository.PlatformVerified {
+				ref, parseErr := image.Parse(event.Repository.String())
+				if parseErr != nil {
+					continue
+				}
+				platforms, resolutionErr := p.releaseImagePlatforms(release.Namespace, release.Name, &types.TrackedImage{Image: ref})
+				if resolutionErr != types.PlatformErrorNone || !types.PlatformsSupportAll(event.Repository.Platforms, platforms) {
+					log.WithFields(log.Fields{
+						"candidate_platforms": event.Repository.Platforms,
+						"eligible_platforms":  platforms,
+						"reason":              resolutionErr,
+						"name":                release.Name,
+						"namespace":           release.Namespace,
+					}).Warn("provider.helm3: skipping polling event that is not compatible with current workload platforms")
+					continue
+				}
+			}
 			helm3VersionedUpdatesCounter.With(prometheus.Labels{"chart": fmt.Sprintf("%s/%s", release.Namespace, release.Name)}).Inc()
 			plans = append(plans, plan)
 		}
@@ -295,87 +437,85 @@ func (p *Provider) createUpdatePlans(event *types.Event) ([]*UpdatePlan, error) 
 	return plans, nil
 }
 
+// applyPlans applies every update plan of a single event. Each plan targets
+// a distinct release, so the plans are handed to a bounded worker pool
+// instead of being applied one after another: a slow release update no
+// longer delays the rest of the event (keel-hq/keel#443). Events themselves
+// are still processed one at a time, so ordering is preserved.
 func (p *Provider) applyPlans(plans []*UpdatePlan) error {
-	for _, plan := range plans {
+	concurrent.Run(concurrentPlanWorkers, len(plans), func(i int) {
+		p.applyPlan(plans[i])
+	})
+	return nil
+}
+
+// applyPlan applies a single update plan to its release and sends the
+// surrounding notifications.
+func (p *Provider) applyPlan(plan *UpdatePlan) {
+	currentVersion := formatVersionWithDigest(plan.CurrentVersion, plan.CurrentDigest)
+	newVersion := formatVersionWithDigest(plan.NewVersion, plan.NewDigest)
+
+	p.sender.Send(types.EventNotification{
+		ResourceKind: "chart",
+		Identifier:   fmt.Sprintf("%s/%s/%s", "chart", plan.Namespace, plan.Name),
+		Name:         "update release",
+		Message:      fmt.Sprintf("Preparing to update release %s/%s %s->%s (%s)", plan.Namespace, plan.Name, currentVersion, newVersion, strings.Join(mapToSlice(plan.Values), ", ")),
+		CreatedAt:    time.Now(),
+		Type:         types.NotificationPreReleaseUpdate,
+		Level:        types.LevelDebug,
+		Channels:     plan.Config.NotificationChannels,
+		Metadata:     releaseMetadata(plan, p.GetName()),
+	})
+
+	// err := updateHelmRelease(p.implementer, plan.Name, plan.Chart, plan.Values)
+	err := updateHelmRelease(p.implementer, plan.Name, plan.Chart, plan.Values, plan.Namespace, plan.EmptyConfig)
+	if err != nil {
+		log.WithFields(log.Fields{
+			"error":     err,
+			"name":      plan.Name,
+			"namespace": plan.Namespace,
+		}).Error("provider.helm3: failed to apply plan")
 
 		p.sender.Send(types.EventNotification{
 			ResourceKind: "chart",
 			Identifier:   fmt.Sprintf("%s/%s/%s", "chart", plan.Namespace, plan.Name),
 			Name:         "update release",
-			Message:      fmt.Sprintf("Preparing to update release %s/%s %s->%s (%s)", plan.Namespace, plan.Name, plan.CurrentVersion, plan.NewVersion, strings.Join(mapToSlice(plan.Values), ", ")),
-			CreatedAt:    time.Now(),
-			Type:         types.NotificationPreReleaseUpdate,
-			Level:        types.LevelDebug,
-			Channels:     plan.Config.NotificationChannels,
-			Metadata: map[string]string{
-				"provider":  p.GetName(),
-				"namespace": plan.Namespace,
-				"name":      plan.Name,
-			},
-		})
-
-		// err := updateHelmRelease(p.implementer, plan.Name, plan.Chart, plan.Values)
-		err := updateHelmRelease(p.implementer, plan.Name, plan.Chart, plan.Values, plan.Namespace, plan.EmptyConfig)
-		if err != nil {
-			log.WithFields(log.Fields{
-				"error":     err,
-				"name":      plan.Name,
-				"namespace": plan.Namespace,
-			}).Error("provider.helm3: failed to apply plan")
-
-			p.sender.Send(types.EventNotification{
-				ResourceKind: "chart",
-				Identifier:   fmt.Sprintf("%s/%s/%s", "chart", plan.Namespace, plan.Name),
-				Name:         "update release",
-				Message:      fmt.Sprintf("Release update failed %s/%s %s->%s (%s), error: %s", plan.Namespace, plan.Name, plan.CurrentVersion, plan.NewVersion, strings.Join(mapToSlice(plan.Values), ", "), err),
-				CreatedAt:    time.Now(),
-				Type:         types.NotificationReleaseUpdate,
-				Level:        types.LevelError,
-				Channels:     plan.Config.NotificationChannels,
-				Metadata: map[string]string{
-					"provider":  p.GetName(),
-					"namespace": plan.Namespace,
-					"name":      plan.Name,
-				},
-			})
-			continue
-		}
-
-		err = p.updateComplete(plan)
-		if err != nil {
-			log.WithFields(log.Fields{
-				"error":     err,
-				"name":      plan.Name,
-				"namespace": plan.Namespace,
-			}).Debug("provider.helm3: got error while resetting approvals counter after successful update")
-		}
-
-		var msg string
-		if len(plan.ReleaseNotes) == 0 {
-			msg = fmt.Sprintf("Successfully updated release %s/%s %s->%s (%s)", plan.Namespace, plan.Name, plan.CurrentVersion, plan.NewVersion, strings.Join(mapToSlice(plan.Values), ", "))
-		} else {
-			msg = fmt.Sprintf("Successfully updated release %s/%s %s->%s (%s). Release notes: %s", plan.Namespace, plan.Name, plan.CurrentVersion, plan.NewVersion, strings.Join(mapToSlice(plan.Values), ", "), strings.Join(plan.ReleaseNotes, ", "))
-		}
-
-		p.sender.Send(types.EventNotification{
-			ResourceKind: "chart",
-			Identifier:   fmt.Sprintf("%s/%s/%s", "chart", plan.Namespace, plan.Name),
-			Name:         "update release",
-			Message:      msg,
+			Message:      fmt.Sprintf("Release update failed %s/%s %s->%s (%s), error: %s", plan.Namespace, plan.Name, currentVersion, newVersion, strings.Join(mapToSlice(plan.Values), ", "), err),
 			CreatedAt:    time.Now(),
 			Type:         types.NotificationReleaseUpdate,
-			Level:        types.LevelSuccess,
+			Level:        types.LevelError,
 			Channels:     plan.Config.NotificationChannels,
-			Metadata: map[string]string{
-				"provider":  p.GetName(),
-				"namespace": plan.Namespace,
-				"name":      plan.Name,
-			},
+			Metadata:     releaseMetadata(plan, p.GetName()),
 		})
-
+		return
 	}
 
-	return nil
+	if err := p.updateComplete(plan); err != nil {
+		log.WithFields(log.Fields{
+			"error":     err,
+			"name":      plan.Name,
+			"namespace": plan.Namespace,
+		}).Debug("provider.helm3: got error while resetting approvals counter after successful update")
+	}
+
+	var msg string
+	if len(plan.ReleaseNotes) == 0 {
+		msg = fmt.Sprintf("Successfully updated release %s/%s %s->%s (%s)", plan.Namespace, plan.Name, currentVersion, newVersion, strings.Join(mapToSlice(plan.Values), ", "))
+	} else {
+		msg = fmt.Sprintf("Successfully updated release %s/%s %s->%s (%s). Release notes: %s", plan.Namespace, plan.Name, currentVersion, newVersion, strings.Join(mapToSlice(plan.Values), ", "), strings.Join(plan.ReleaseNotes, ", "))
+	}
+
+	p.sender.Send(types.EventNotification{
+		ResourceKind: "chart",
+		Identifier:   fmt.Sprintf("%s/%s/%s", "chart", plan.Namespace, plan.Name),
+		Name:         "update release",
+		Message:      msg,
+		CreatedAt:    time.Now(),
+		Type:         types.NotificationReleaseUpdate,
+		Level:        types.LevelSuccess,
+		Channels:     plan.Config.NotificationChannels,
+		Metadata:     releaseMetadata(plan, p.GetName()),
+	})
 }
 
 func updateHelmRelease(implementer Implementer, releaseName string, chart *hapi_chart.Chart, overrideValues map[string]string, namespace string, opts ...bool) error {
@@ -406,6 +546,33 @@ func mapToSlice(values map[string]string) []string {
 		converted = append(converted, concat)
 	}
 	return converted
+}
+
+// formatVersionWithDigest renders a version for notification messages,
+// appending the image digest when known. It makes tag updates that keep the
+// same tag (e.g. latest -> latest) identifiable by the image hash they move.
+func formatVersionWithDigest(version, digest string) string {
+	if digest == "" {
+		return version
+	}
+	return fmt.Sprintf("%s (%s)", version, digest)
+}
+
+// releaseMetadata builds notification metadata for a release update, carrying
+// the image digests alongside the identity fields when known.
+func releaseMetadata(plan *UpdatePlan, providerName string) map[string]string {
+	metadata := map[string]string{
+		"provider":  providerName,
+		"namespace": plan.Namespace,
+		"name":      plan.Name,
+	}
+	if plan.CurrentDigest != "" {
+		metadata["previousDigest"] = plan.CurrentDigest
+	}
+	if plan.NewDigest != "" {
+		metadata["newDigest"] = plan.NewDigest
+	}
+	return metadata
 }
 
 // parse

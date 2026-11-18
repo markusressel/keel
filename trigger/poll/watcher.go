@@ -6,11 +6,12 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/keel-hq/keel/util/image"
+
 	"github.com/keel-hq/keel/extension/credentialshelper"
 	"github.com/keel-hq/keel/provider"
 	"github.com/keel-hq/keel/registry"
 	"github.com/keel-hq/keel/types"
-	"github.com/keel-hq/keel/util/image"
 	"github.com/keel-hq/keel/util/version"
 	"github.com/rusenask/cron"
 
@@ -50,8 +51,7 @@ type watchDetails struct {
 	digest       string // image digest
 	latest       string // latest tag
 	schedule     string
-
-	mu sync.RWMutex
+	mu           sync.RWMutex
 }
 
 // RepositoryWatcher - repository watcher cron
@@ -90,33 +90,22 @@ func (w *RepositoryWatcher) Start(ctx context.Context) {
 	}()
 }
 
+// This identifier is used to key the watchers, so that only a watcher
+// is setup per identifier
 func getImageIdentifier(ref *image.Reference, keepTag bool) string {
-	_, err := version.GetVersion(ref.Tag())
-	// if failed to parse version, will need to watch digest
-	if err != nil || keepTag == true {
+	if keepTag == true {
 		return ref.Registry() + "/" + ref.ShortName() + ":" + ref.Tag()
 	}
-
 	return ref.Registry() + "/" + ref.ShortName()
 }
 
 // Unwatch - stop watching for changes
-func (w *RepositoryWatcher) Unwatch(imageName string) error {
-	imageRef, err := image.Parse(imageName)
-	if err != nil {
-		log.WithFields(log.Fields{
-			"error":      err,
-			"image_name": imageName,
-		}).Error("trigger.poll.RepositoryWatcher.Unwatch: failed to parse image")
-		return err
-	}
-	key := getImageIdentifier(imageRef, false)
-	_, ok := w.watched[key]
+func (w *RepositoryWatcher) Unwatch(imageIdentifier string) error {
+	_, ok := w.watched[imageIdentifier]
 	if ok {
-		w.cron.DeleteJob(key)
-		delete(w.watched, key)
+		w.cron.DeleteJob(imageIdentifier)
+		delete(w.watched, imageIdentifier)
 	}
-
 	return nil
 }
 
@@ -127,11 +116,23 @@ func (w *RepositoryWatcher) Watch(images ...*types.TrackedImage) error {
 	var errs []string
 	tracked := map[string]bool{}
 
+	// a watcher can be shared by several workloads, any one of them running a
+	// stale digest is drift the watcher has to report, so the digests are kept
+	// grouped per workload rather than merged into one set
+	running := map[string][][]string{}
+	for _, image := range images {
+		if image.Trigger != types.TriggerTypePoll || len(image.RunningDigests) == 0 {
+			continue
+		}
+		key := getImageIdentifier(image.Image, image.Policy.KeepTag())
+		running[key] = append(running[key], image.RunningDigests)
+	}
+
 	for _, image := range images {
 		if image.Trigger != types.TriggerTypePoll {
 			continue
 		}
-		identifier, err := w.watch(image)
+		identifier, err := w.watch(image, running[getImageIdentifier(image.Image, image.Policy.KeepTag())])
 		if err != nil {
 			errs = append(errs, err.Error())
 			continue
@@ -167,7 +168,7 @@ func (w *RepositoryWatcher) unwatch(tracked map[string]bool) {
 	}
 }
 
-func (w *RepositoryWatcher) watch(image *types.TrackedImage) (string, error) {
+func (w *RepositoryWatcher) watch(image *types.TrackedImage, runningDigests [][]string) (string, error) {
 
 	if image.PollSchedule == "" {
 		return "", fmt.Errorf("cron schedule cannot be empty")
@@ -183,14 +184,12 @@ func (w *RepositoryWatcher) watch(image *types.TrackedImage) (string, error) {
 		return "", fmt.Errorf("invalid cron schedule: %s", err)
 	}
 
-	keepTag := image.Policy != nil && image.Policy.Name() == "force"
-	key := getImageIdentifier(image.Image, keepTag)
+	key := getImageIdentifier(image.Image, image.Policy.KeepTag())
 
 	// checking whether it's already being watched
 	details, ok := w.watched[key]
 	if !ok {
-		// err = w.addJob(imageRef, registryUsername, registryPassword, schedule)
-		err = w.addJob(image, image.PollSchedule)
+		err = w.addJob(image, image.PollSchedule, runningDigests)
 		if err != nil {
 			log.WithFields(log.Fields{
 				"error": err,
@@ -202,6 +201,8 @@ func (w *RepositoryWatcher) watch(image *types.TrackedImage) (string, error) {
 	}
 
 	// checking schedule
+	// todo: this is not right, we are using the last seen schedule, which might not be the most frequent
+	// the most frequent schedule should be used for the shared watcher
 	if details.schedule != image.PollSchedule {
 		err := w.cron.UpdateJob(key, image.PollSchedule)
 		if err != nil {
@@ -222,7 +223,56 @@ func (w *RepositoryWatcher) watch(image *types.TrackedImage) (string, error) {
 	return key, nil
 }
 
-func (w *RepositoryWatcher) addJob(ti *types.TrackedImage, schedule string) error {
+// runtimeBaseline reports a digest that a workload is running when no workload
+// sharing this watcher runs the digest the tag resolves to. It is deliberately
+// conservative: a workload that runs the current digest on at least one replica
+// is mid-rollout, not stale, and the per-platform manifests of a multi-arch
+// image index never equal the index digest a registry reports.
+func (w *RepositoryWatcher) runtimeBaseline(ti *types.TrackedImage, workloads [][]string, registryOpts registry.Opts, digest string) (string, bool) {
+	known := map[string]bool{digest: true}
+	var candidates [][]string
+	for _, workload := range workloads {
+		if len(workload) > 0 && !matchesAny(workload, known) {
+			candidates = append(candidates, workload)
+		}
+	}
+	if len(candidates) == 0 {
+		return "", false
+	}
+
+	// the tag may resolve to an image index whose children are what nodes run
+	tagDigests, err := w.registryClient.Digests(registryOpts)
+	if err != nil {
+		// without the full digest set a mismatch cannot be told apart from a
+		// multi-arch image, so keep the registry digest as the baseline
+		log.WithFields(log.Fields{
+			"error": err,
+			"image": ti.Image.String(),
+		}).Warn("trigger.poll.RepositoryWatcher.addJob: failed to resolve tag manifest digests, cannot check for runtime drift")
+		return "", false
+	}
+	for _, tagDigest := range tagDigests {
+		known[tagDigest] = true
+	}
+
+	for _, workload := range candidates {
+		if !matchesAny(workload, known) {
+			return workload[0], true
+		}
+	}
+	return "", false
+}
+
+func matchesAny(digests []string, known map[string]bool) bool {
+	for _, d := range digests {
+		if known[d] {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *RepositoryWatcher) addJob(ti *types.TrackedImage, schedule string, runningDigests [][]string) error {
 	// getting initial digest
 	reg := ti.Image.Scheme() + "://" + ti.Image.Registry()
 
@@ -249,11 +299,27 @@ func (w *RepositoryWatcher) addJob(ti *types.TrackedImage, schedule string) erro
 		return err
 	}
 
-	keepTag := ti.Policy != nil && ti.Policy.Name() == "force"
-	key := getImageIdentifier(ti.Image, keepTag)
+	key := getImageIdentifier(ti.Image, ti.Policy.KeepTag())
+
+	// The baseline is what the workload is running, not what the registry
+	// serves. Seeding it with the registry digest hides drift that happened
+	// while Keel was not watching (the watcher state is in-memory only, so
+	// every restart starts from scratch) - https://github.com/keel-hq/keel/issues/845
+	baseline := digest
+	if ti.Policy.KeepTag() {
+		if running, ok := w.runtimeBaseline(ti, runningDigests, registryOpts, digest); ok {
+			log.WithFields(log.Fields{
+				"image":           ti.Image.String(),
+				"registry_digest": digest,
+				"running_digests": runningDigests,
+			}).Info("trigger.poll.RepositoryWatcher.addJob: workload is not running the current tag digest, seeding watcher with the running digest")
+			baseline = running
+		}
+	}
+
 	details := &watchDetails{
 		trackedImage: ti,
-		digest:       digest, // current image digest
+		digest:       baseline, // digest the workload is known to be running
 		latest:       ti.Image.Tag(),
 		schedule:     schedule,
 	}
@@ -261,27 +327,20 @@ func (w *RepositoryWatcher) addJob(ti *types.TrackedImage, schedule string) erro
 	// adding job to internal map
 	w.watched[key] = details
 
-	// checking tag type:
-	//  - for versioned (semver) tags:
-	//    - we setup a watch all tags job (default)
-	//    - if "force" to follow a floating tag, a single tag watcher is
-	//      setup, which checks digest
-	//  - for non-semver types we create a single tag watcher which
-	// checks digest
-	_, err = version.GetVersion(ti.Image.Tag())
-	if err != nil || keepTag == true {
+	// read the docs several times, the only legit case when want a tag watcher
+	// is when policy is force and keel.sh/match-tag=true.
+	if ti.Policy.KeepTag() {
 		// adding new job
 		job := NewWatchTagJob(w.providers, w.registryClient, details)
 		log.WithFields(log.Fields{
 			"job_name": key,
 			"image":    ti.Image.String(),
-			"digest":   digest,
+			"digest":   baseline,
 			"schedule": schedule,
 		}).Info("trigger.poll.RepositoryWatcher: new watch tag digest job added")
 
 		// running it now
 		job.Run()
-
 		return w.cron.AddJob(key, schedule, job)
 	}
 
@@ -289,14 +348,10 @@ func (w *RepositoryWatcher) addJob(ti *types.TrackedImage, schedule string) erro
 	job := NewWatchRepositoryTagsJob(w.providers, w.registryClient, details)
 	log.WithFields(log.Fields{
 		"job_name": key,
-		"image":    ti.Image.String(),
-		"digest":   digest,
+		"image":    ti.Image.Registry() + "/" + ti.Image.ShortName(), // A watcher can be shared, so it makes little sense to specify tag depth here
+		"digest":   "",                                               // A watcher can be shared, so it makes little sense to specify here a specific image digest used by one of the consumers
 		"schedule": schedule,
 	}).Info("trigger.poll.RepositoryWatcher: new watch repository tags job added")
-
-	// running it now
 	job.Run()
-
 	return w.cron.AddJob(key, schedule, job)
-
 }

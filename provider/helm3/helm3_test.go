@@ -1,11 +1,11 @@
 package helm3
 
 import (
-	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
 
 	"github.com/keel-hq/keel/approvals"
@@ -21,7 +21,7 @@ import (
 )
 
 func newTestingUtils() (*sql.SQLStore, func()) {
-	dir, err := ioutil.TempDir("", "whstoretest")
+	dir, err := os.MkdirTemp("", "whstoretest")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -47,6 +47,7 @@ func approver() (*approvals.DefaultManager, func()) {
 }
 
 type fakeSender struct {
+	mu        sync.Mutex
 	sentEvent types.EventNotification
 }
 
@@ -55,11 +56,15 @@ func (s *fakeSender) Configure(cfg *notification.Config) (bool, error) {
 }
 
 func (s *fakeSender) Send(event types.EventNotification) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.sentEvent = event
 	return nil
 }
 
 type fakeImplementer struct {
+	mu sync.Mutex
+
 	listReleasesResponse []*release.Release
 
 	// updated info
@@ -74,9 +79,11 @@ func (i *fakeImplementer) ListReleases() ([]*release.Release, error) {
 
 func (i *fakeImplementer) UpdateReleaseFromChart(rlsName string, chart *chart.Chart, vals map[string]string, namespace string, opts ...bool) (*release.Release, error) {
 	// func (i *fakeImplementer) UpdateReleaseFromChart(rlsName string, chart *chart.Chart, opts ...helm.UpdateOption) (*rls.UpdateReleaseResponse, error) {
+	i.mu.Lock()
 	i.updatedRlsName = rlsName
 	i.updatedChart = chart
 	// i.updatedOptions = opts
+	i.mu.Unlock()
 
 	return &release.Release{
 		Name:    rlsName,

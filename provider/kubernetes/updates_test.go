@@ -8,6 +8,7 @@ import (
 	"github.com/keel-hq/keel/internal/k8s"
 	"github.com/keel-hq/keel/internal/policy"
 	"github.com/keel-hq/keel/types"
+	"github.com/keel-hq/keel/util/image"
 	"github.com/keel-hq/keel/util/timeutil"
 
 	apps_v1 "k8s.io/api/apps/v1"
@@ -21,6 +22,94 @@ func mustParseGlob(str string) policy.Policy {
 		panic(err)
 	}
 	return p
+}
+
+func TestProvider_checkForUpdateImageVolumeOptIn(t *testing.T) {
+	tests := []struct {
+		name        string
+		labels      map[string]string
+		annotations map[string]string
+		wantUpdate  bool
+	}{
+		{
+			name:       "canonical label only",
+			labels:     map[string]string{types.KeelImageVolumeAnnotation: "true"},
+			wantUpdate: true,
+		},
+		{
+			name:        "case variant annotation",
+			annotations: map[string]string{"Keel.sh/ImageVolumes": "true"},
+			wantUpdate:  true,
+		},
+		{
+			name:        "canonical annotation",
+			annotations: map[string]string{types.KeelImageVolumeAnnotation: "true"},
+			wantUpdate:  true,
+		},
+		{
+			name:       "no opt-in",
+			labels:     map[string]string{},
+			wantUpdate: false,
+		},
+		{
+			name:        "label takes precedence over annotation",
+			labels:      map[string]string{types.KeelImageVolumeAnnotation: "false"},
+			annotations: map[string]string{types.KeelImageVolumeAnnotation: "true"},
+			wantUpdate:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resource := MustParseGR(&apps_v1.Deployment{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Name:        "dep-1",
+					Namespace:   "xxxx",
+					Labels:      tt.labels,
+					Annotations: tt.annotations,
+				},
+				Spec: apps_v1.DeploymentSpec{
+					Template: v1.PodTemplateSpec{
+						Spec: v1.PodSpec{
+							Volumes: []v1.Volume{
+								{
+									Name: "oci-config",
+									VolumeSource: v1.VolumeSource{
+										Image: &v1.ImageVolumeSource{
+											Reference: "gcr.io/v2-namespace/hello-world:1.1.1",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			})
+
+			plan, updated, err := checkForUpdate(
+				policy.NewForcePolicy(false),
+				&types.Repository{Name: "gcr.io/v2-namespace/hello-world", Tag: "1.1.2"},
+				resource,
+			)
+			if err != nil {
+				t.Fatalf("checkForUpdate() error = %v", err)
+			}
+			if updated != tt.wantUpdate {
+				t.Fatalf("checkForUpdate() updated = %v, want %v", updated, tt.wantUpdate)
+			}
+
+			wantReference := "gcr.io/v2-namespace/hello-world:1.1.1"
+			if tt.wantUpdate {
+				wantReference = "gcr.io/v2-namespace/hello-world:1.1.2"
+				if plan.Resource != resource {
+					t.Errorf("checkForUpdate() did not return the updated resource")
+				}
+			}
+			if got := resource.Volumes()[0].Image.Reference; got != wantReference {
+				t.Errorf("image volume reference = %q, want %q", got, wantReference)
+			}
+		})
+	}
 }
 
 func TestProvider_checkForUpdate(t *testing.T) {
@@ -742,6 +831,11 @@ func TestProvider_checkForUpdate(t *testing.T) {
 			}
 
 			if gotShouldUpdateDeployment {
+				ref, err := image.Parse(tt.args.repo.String())
+				if err != nil {
+					t.Fatal(err)
+				}
+				tt.wantUpdatePlan.Image = ref.Remote()
 				ann := gotUpdatePlan.Resource.GetSpecAnnotations()
 
 				if ann[types.KeelUpdateTimeAnnotation] != "" {
@@ -1227,6 +1321,11 @@ func TestProvider_checkForUpdateSemver(t *testing.T) {
 			}
 
 			if gotShouldUpdateDeployment {
+				ref, err := image.Parse(tt.args.repo.String())
+				if err != nil {
+					t.Fatal(err)
+				}
+				tt.wantUpdatePlan.Image = ref.Remote()
 				ann := gotUpdatePlan.Resource.GetSpecAnnotations()
 				_, ok := ann[types.KeelUpdateTimeAnnotation]
 				if ok {

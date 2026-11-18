@@ -3,12 +3,11 @@ package docker
 import (
 	"bytes"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
-	manifestV2 "github.com/docker/distribution/manifest/schema2"
+	manifestV2 "github.com/distribution/distribution/v3/manifest/schema2"
 )
 
 func TestGetDigest(t *testing.T) {
@@ -26,13 +25,13 @@ func TestGetDigest(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, _ := ioutil.ReadAll(resp.Body)
+	bodyBytes, _ := io.ReadAll(resp.Body)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Add("content-type", "application/vnd.docker.distribution.manifest.v2+json; charset=ISO-8859-1")
 		io.Copy(w, resp.Body)
 
 		// Reset body for additional calls
-		resp.Body = ioutil.NopCloser(bytes.NewBuffer(bodyBytes))
+		resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 	}))
 	defer ts.Close()
 

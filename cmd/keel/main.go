@@ -8,8 +8,9 @@ import (
 
 	"context"
 
+	kingpin "github.com/alecthomas/kingpin/v2"
 	"github.com/prometheus/client_golang/prometheus"
-	kingpin "gopkg.in/alecthomas/kingpin.v2"
+
 	kube "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
@@ -17,11 +18,11 @@ import (
 
 	// "github.com/keel-hq/keel/cache/memory"
 	"github.com/keel-hq/keel/pkg/auth"
+	"github.com/keel-hq/keel/pkg/config"
 	"github.com/keel-hq/keel/pkg/http"
 	"github.com/keel-hq/keel/pkg/store"
 	"github.com/keel-hq/keel/pkg/store/sql"
 
-	"github.com/keel-hq/keel/constants"
 	"github.com/keel-hq/keel/extension/credentialshelper"
 	"github.com/keel-hq/keel/extension/notification"
 	"github.com/keel-hq/keel/internal/k8s"
@@ -50,16 +51,7 @@ import (
 	_ "helm.sh/helm/v3/pkg/action"
 )
 
-// gcloud pubsub related config
 const (
-	EnvTriggerPubSub = "PUBSUB" // set to 1 or something to enable pub/sub trigger
-	EnvTriggerPoll   = "POLL"   // set to 0 to disable poll trigger
-	EnvProjectID     = "PROJECT_ID"
-	EnvClusterName   = "CLUSTER_NAME"
-	EnvDataDir       = "XDG_DATA_HOME"
-	EnvHelm3Provider = "HELM3_PROVIDER" // helm3 provider
-	EnvUIDir         = "UI_DIR"
-
 	// EnvDefaultDockerRegistryCfg - default registry configuration that can be passed into
 	// keel for polling trigger
 	EnvDefaultDockerRegistryCfg = "DOCKER_REGISTRY_CFG"
@@ -67,22 +59,45 @@ const (
 
 // kubernetes config, if empty - will default to InCluster
 const (
-	EnvKubernetesConfig = "KUBERNETES_CONFIG"
+	EnvKubernetesConfig    = "KUBERNETES_CONFIG"
+	EnvKubernetesMasterUrl = "KUBERNETES_MASTERURL"
+	EnvKubernetesContext   = "KUBERNETES_CONTEXT"
 )
 
-// EnvDebug - set to 1 or anything else to enable debug logging
-const EnvDebug = "DEBUG"
-
+// @title Keel HTTP API
+// @version 1.0
+// @description HTTP API exposed by Keel. Admin routes are registered only when an authenticator is enabled. Provider webhooks require Basic or Bearer authorization only when authenticated webhooks are enabled; the registry webhook is always unauthenticated.
+// @BasePath /
+// @tag.name System
+// @tag.description Health and version operations.
+// @tag.name Auth
+// @tag.description Administrator authentication operations.
+// @tag.name Admin
+// @tag.description Authenticator-enabled administration operations.
+// @tag.name Webhooks
+// @tag.description Container registry webhook receivers.
+// @securityDefinitions.basic BasicAuth
+// @securityDefinitions.apikey BearerAuth
+// @in header
+// @name Authorization
 func main() {
 	ver := version.GetKeelVersion()
 
 	inCluster := kingpin.Flag("incluster", "use in cluster configuration (defaults to 'true'), use '--no-incluster' if running outside of the cluster").Default("true").Bool()
 	kubeconfig := kingpin.Flag("kubeconfig", "path to kubeconfig (if not in running inside a cluster)").Default(filepath.Join(os.Getenv("HOME"), ".kube", "config")).String()
-	uiDir := kingpin.Flag("ui-dir", "path to web UI static files").Default("www").Envar(EnvUIDir).String()
+	uiDir := kingpin.Flag("ui-dir", "path to web UI static files").String()
 
 	kingpin.UsageTemplate(kingpin.CompactUsageTemplate).Version(ver.Version)
 	kingpin.CommandLine.Help = "Automated Kubernetes deployment updates. Learn more on https://keel.sh."
 	kingpin.Parse()
+
+	cfg, err := config.Load()
+	if err != nil {
+		log.WithError(err).Fatal("invalid application configuration")
+	}
+	if *uiDir != "" {
+		cfg.UI.Dir = *uiDir
+	}
 
 	log.WithFields(log.Fields{
 		"os":         ver.OS,
@@ -93,18 +108,18 @@ func main() {
 		"arch":       ver.Arch,
 	}).Info("keel starting...")
 
-	if os.Getenv(EnvDebug) == "true" {
+	if cfg.Debug {
 		log.SetLevel(log.DebugLevel)
 	}
 
-	dataDir := "/data"
-	if os.Getenv(EnvDataDir) != "" {
-		dataDir = os.Getenv(EnvDataDir)
+	authConfig, err := auth.FromConfig(cfg.Auth)
+	if err != nil {
+		log.WithError(err).Fatal("invalid administrator authentication configuration")
 	}
 
 	sqlStore, err := sql.New(sql.Opts{
 		DatabaseType: "sqlite3",
-		URI:          filepath.Join(dataDir, "keel.db"),
+		URI:          filepath.Join(cfg.Storage.DataDir, "keel.db"),
 	})
 	if err != nil {
 		log.WithFields(log.Fields{
@@ -113,7 +128,7 @@ func main() {
 		os.Exit(1)
 	}
 	log.WithFields(log.Fields{
-		"database_path": filepath.Join(dataDir, "keel.db"),
+		"database_path": filepath.Join(cfg.Storage.DataDir, "keel.db"),
 		"type":          "sqlite3",
 	}).Info("initializing database")
 
@@ -126,20 +141,19 @@ func main() {
 	defer cancel()
 
 	notificationLevel := types.LevelInfo
-	if os.Getenv(constants.EnvNotificationLevel) != "" {
-		parsedLevel, err := types.ParseLevel(os.Getenv(constants.EnvNotificationLevel))
-		if err != nil {
-			log.WithFields(log.Fields{
-				"error": err,
-			}).Errorf("main: got error while parsing notification level, defaulting to: %s", notificationLevel)
-		} else {
-			notificationLevel = parsedLevel
-		}
+	parsedLevel, err := types.ParseLevel(cfg.Notifications.Level)
+	if err != nil {
+		log.WithFields(log.Fields{
+			"error": err,
+		}).Errorf("main: got error while parsing notification level, defaulting to: %s", notificationLevel)
+	} else {
+		notificationLevel = parsedLevel
 	}
 
 	notifCfg := &notification.Config{
-		Attempts: 10,
-		Level:    notificationLevel,
+		Attempts:      10,
+		Level:         notificationLevel,
+		Notifications: cfg.Notifications,
 	}
 	sender := notification.New(ctx)
 
@@ -157,6 +171,14 @@ func main() {
 
 	if os.Getenv(EnvKubernetesConfig) != "" {
 		k8sCfg.ConfigPath = os.Getenv(EnvKubernetesConfig)
+	}
+
+	if os.Getenv(EnvKubernetesMasterUrl) != "" {
+		k8sCfg.MasterUrl = os.Getenv(EnvKubernetesMasterUrl)
+	}
+
+	if os.Getenv(EnvKubernetesContext) != "" {
+		k8sCfg.CurrentContext = os.Getenv(EnvKubernetesContext)
 	}
 
 	k8sCfg.InCluster = *inCluster
@@ -177,10 +199,11 @@ func main() {
 
 	buf := k8s.NewBuffer(&g, t, log.StandardLogger(), 128)
 	wl := log.WithField("context", "watch")
-	k8s.WatchDeployments(&g, implementer.Client(), wl, buf)
-	k8s.WatchStatefulSets(&g, implementer.Client(), wl, buf)
-	k8s.WatchDaemonSets(&g, implementer.Client(), wl, buf)
-	k8s.WatchCronJobs(&g, implementer.Client(), wl, buf)
+	k8s.WatchDeployments(&g, implementer.Client(), wl, cfg.Kubernetes, buf)
+	k8s.WatchStatefulSets(&g, implementer.Client(), wl, cfg.Kubernetes, buf)
+	k8s.WatchDaemonSets(&g, implementer.Client(), wl, cfg.Kubernetes, buf)
+	k8s.WatchCronJobs(&g, implementer.Client(), wl, cfg.Kubernetes, buf)
+	implementer.UsePodCache(k8s.WatchPods(&g, implementer.Client(), wl, cfg.Kubernetes))
 
 	// approvalsCache := memory.NewMemoryCache()
 	approvalsManager := approvals.New(&approvals.Opts{
@@ -211,6 +234,7 @@ func main() {
 		store:            sqlStore,
 		k8sClient:        implementer.Client(),
 		config:           implementer.Config(),
+		appConfig:        cfg,
 	})
 
 	// registering secrets based credentials helper
@@ -237,7 +261,9 @@ func main() {
 		grc:              &t.GenericResourceCache,
 		k8sClient:        implementer,
 		store:            sqlStore,
-		uiDir:            *uiDir,
+		uiDir:            cfg.UI.Dir,
+		authConfig:       authConfig,
+		appConfig:        cfg,
 	})
 
 	signalChan := make(chan os.Signal, 1)
@@ -277,14 +303,17 @@ type ProviderOpts struct {
 
 	k8sClient kube.Interface
 	config    *rest.Config
+	appConfig config.Config
 }
 
 // setupProviders - setting up available providers. New providers should be initialised here and added to
 // provider map
 func setupProviders(opts *ProviderOpts) (providers provider.Providers) {
 	var enabledProviders []provider.Provider
+	platformResolver := k8s.NewPlatformResolver(opts.k8sImplementer)
+	runningDigestResolver := k8s.NewRunningDigestResolver(opts.k8sImplementer)
 
-	k8sProvider, err := kubernetes.NewProvider(opts.k8sImplementer, opts.sender, opts.approvalsManager, opts.grc)
+	k8sProvider, err := kubernetes.NewProvider(opts.k8sImplementer, opts.sender, opts.approvalsManager, opts.grc, platformResolver)
 	if err != nil {
 		log.WithFields(log.Fields{
 			"error": err,
@@ -301,9 +330,9 @@ func setupProviders(opts *ProviderOpts) (providers provider.Providers) {
 
 	enabledProviders = append(enabledProviders, k8sProvider)
 
-	if os.Getenv(EnvHelm3Provider) == "1" || os.Getenv(EnvHelm3Provider) == "true" {
+	if opts.appConfig.Providers.Helm3 {
 		helm3Implementer := helm3.NewHelm3Implementer()
-		helm3Provider := helm3.NewProvider(helm3Implementer, opts.sender, opts.approvalsManager)
+		helm3Provider := helm3.NewProvider(helm3Implementer, opts.sender, opts.approvalsManager, helm3.WithWorkloadPlatforms(platformResolver, opts.grc), helm3.WithRunningDigests(runningDigestResolver))
 
 		go func() {
 			err := helm3Provider.Start()
@@ -330,6 +359,8 @@ type TriggerOpts struct {
 	k8sClient        kubernetes.Implementer
 	store            store.Store
 	uiDir            string
+	authConfig       auth.Config
+	appConfig        config.Config
 }
 
 // setupTriggers - setting up triggers. New triggers should be added to this function. Each trigger
@@ -337,19 +368,10 @@ type TriggerOpts struct {
 // func setupTriggers(ctx context.Context, providers provider.Providers, approvalsManager approvals.Manager, grc *k8s.GenericResourceCache, k8sClient kubernetes.Implementer) (teardown func()) {
 func setupTriggers(ctx context.Context, opts *TriggerOpts) (teardown func()) {
 
-	_username := os.Getenv(constants.EnvBasicAuthUser)
-	if _username == "" {
-		_username = "admin"
-	}
-	_password := os.Getenv(constants.EnvBasicAuthPassword)
-	if _password == "" {
-		_password = "admin"
-	}
-
 	authenticator := auth.New(&auth.Opts{
-		Username: _username,
-		Password: _password,
-		Secret:   []byte(os.Getenv(constants.EnvTokenSecret)),
+		Username: opts.authConfig.Username,
+		Password: opts.authConfig.Password,
+		Secret:   []byte(opts.appConfig.Auth.TokenSecret),
 	})
 
 	// setting up generic http webhook server
@@ -362,8 +384,20 @@ func setupTriggers(ctx context.Context, opts *TriggerOpts) (teardown func()) {
 		Store:                 opts.store,
 		Authenticator:         authenticator,
 		UIDir:                 opts.uiDir,
-		AuthenticatedWebhooks: os.Getenv(constants.EnvAuthenticatedWebhooks) == "true",
+		Debug:                 opts.appConfig.Debug,
+		AuthenticatedWebhooks: opts.appConfig.Auth.AuthenticatedWebhooks,
+		AuthMode:              opts.authConfig.Mode,
+		AuthProxyUserHeader:   opts.authConfig.ProxyUserHeader,
+		AuthProxyLogoutURL:    opts.authConfig.ProxyLogoutURL,
 	})
+
+	if opts.authConfig.Mode == auth.ModeExternalProxy {
+		log.WithFields(log.Fields{
+			"auth_mode":         opts.authConfig.Mode,
+			"listen_address":    "127.0.0.1",
+			"proxy_user_header": opts.authConfig.ProxyUserHeader,
+		}).Warn("external authentication proxy mode enabled; Keel trusts the configured identity header only because the HTTP listener is loopback-only")
+	}
 
 	go func() {
 		err := whs.Start()
@@ -376,8 +410,8 @@ func setupTriggers(ctx context.Context, opts *TriggerOpts) (teardown func()) {
 	}()
 
 	// checking whether pubsub (GCR) trigger is enabled
-	if os.Getenv(EnvTriggerPubSub) != "" {
-		projectID := os.Getenv(EnvProjectID)
+	if opts.appConfig.Trigger.PubSub {
+		projectID := opts.appConfig.Trigger.ProjectID
 		if projectID == "" {
 			log.Fatalf("main.setupTriggers: project ID env variable not set")
 			return
@@ -394,15 +428,15 @@ func setupTriggers(ctx context.Context, opts *TriggerOpts) (teardown func()) {
 			return
 		}
 
-		subManager := pubsub.NewDefaultManager(os.Getenv(EnvClusterName), projectID, opts.providers, ps)
+		subManager := pubsub.NewDefaultManager(opts.appConfig.Trigger.ClusterName, projectID, opts.providers, ps)
 		go subManager.Start(ctx)
 	}
 
-	if os.Getenv(EnvTriggerPoll) != "0" || os.Getenv(EnvTriggerPoll) != "false" {
+	if opts.appConfig.Trigger.Poll {
 
 		registryClient := registry.New()
 		watcher := poll.NewRepositoryWatcher(opts.providers, registryClient)
-		pollManager := poll.NewPollManager(opts.providers, watcher)
+		pollManager := poll.NewPollManager(opts.providers, watcher, opts.appConfig.Trigger.PollScanInterval)
 
 		// start poll manager, will finish with ctx
 		go watcher.Start(ctx)

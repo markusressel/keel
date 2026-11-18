@@ -1,10 +1,10 @@
 package kubernetes
 
 import (
-	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/keel-hq/keel/approvals"
@@ -43,7 +43,10 @@ func (p *fakeProvider) GetName() string {
 }
 
 type fakeImplementer struct {
+	mu sync.Mutex
+
 	namespaces     *v1.NamespaceList
+	nodeList       *v1.NodeList
 	deployment     *apps_v1.Deployment
 	deploymentList *apps_v1.DeploymentList
 
@@ -60,6 +63,10 @@ func (i *fakeImplementer) Namespaces() (*v1.NamespaceList, error) {
 	return i.namespaces, nil
 }
 
+func (i *fakeImplementer) Nodes() (*v1.NodeList, error) {
+	return i.nodeList, nil
+}
+
 func (i *fakeImplementer) Deployment(namespace, name string) (*apps_v1.Deployment, error) {
 	return i.deployment, nil
 }
@@ -69,6 +76,8 @@ func (i *fakeImplementer) Deployments(namespace string) (*apps_v1.DeploymentList
 }
 
 func (i *fakeImplementer) Update(obj *k8s.GenericResource) error {
+	i.mu.Lock()
+	defer i.mu.Unlock()
 	i.updated = obj
 	return nil
 }
@@ -82,6 +91,8 @@ func (i *fakeImplementer) Pods(namespace, labelSelector string) (*v1.PodList, er
 }
 
 func (i *fakeImplementer) DeletePod(namespace, name string, opts *meta_v1.DeleteOptions) error {
+	i.mu.Lock()
+	defer i.mu.Unlock()
 	i.deletedPods = append(i.deletedPods, &v1.Pod{
 		meta_v1.TypeMeta{},
 		meta_v1.ObjectMeta{
@@ -99,6 +110,7 @@ func (i *fakeImplementer) ConfigMaps(namespace string) core_v1.ConfigMapInterfac
 }
 
 type fakeSender struct {
+	mu        sync.Mutex
 	sentEvent types.EventNotification
 }
 
@@ -107,12 +119,14 @@ func (s *fakeSender) Configure(cfg *notification.Config) (bool, error) {
 }
 
 func (s *fakeSender) Send(event types.EventNotification) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.sentEvent = event
 	return nil
 }
 
 func NewTestingUtils() (*sql.SQLStore, func()) {
-	dir, err := ioutil.TempDir("", "whstoretest")
+	dir, err := os.MkdirTemp("", "whstoretest")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -314,10 +328,10 @@ func TestGetImpactedInit(t *testing.T) {
 		{
 			meta_v1.TypeMeta{},
 			meta_v1.ObjectMeta{
-				Name:      "dep-1",
-				Namespace: "xxxx",
+				Name:        "dep-1",
+				Namespace:   "xxxx",
 				Annotations: map[string]string{types.KeelInitContainerAnnotation: "true"},
-				Labels:    map[string]string{types.KeelPolicyLabel: "all"},
+				Labels:      map[string]string{types.KeelPolicyLabel: "all"},
 			},
 			apps_v1.DeploymentSpec{
 				Template: v1.PodTemplateSpec{
@@ -335,10 +349,10 @@ func TestGetImpactedInit(t *testing.T) {
 		{
 			meta_v1.TypeMeta{},
 			meta_v1.ObjectMeta{
-				Name:      "dep-2",
-				Namespace: "xxxx",
+				Name:        "dep-2",
+				Namespace:   "xxxx",
 				Annotations: map[string]string{types.KeelInitContainerAnnotation: "false"},
-				Labels:    map[string]string{"whatever": "all"},
+				Labels:      map[string]string{"whatever": "all"},
 			},
 			apps_v1.DeploymentSpec{
 				Template: v1.PodTemplateSpec{
@@ -395,6 +409,188 @@ func TestGetImpactedInit(t *testing.T) {
 		t.Errorf("couldn't find expected deployment in impacted deployment list")
 	}
 
+}
+
+func TestGetImpactedImageVolume(t *testing.T) {
+	fp := &fakeImplementer{}
+	fp.namespaces = &v1.NamespaceList{
+		Items: []v1.Namespace{
+			{
+				meta_v1.TypeMeta{},
+				meta_v1.ObjectMeta{Name: "xxxx"},
+				v1.NamespaceSpec{},
+				v1.NamespaceStatus{},
+			},
+		},
+	}
+
+	deps := []*apps_v1.Deployment{
+		{
+			meta_v1.TypeMeta{},
+			meta_v1.ObjectMeta{
+				Name:        "dep-with-image-volume",
+				Namespace:   "xxxx",
+				Annotations: map[string]string{types.KeelImageVolumeAnnotation: "true"},
+				Labels:      map[string]string{types.KeelPolicyLabel: "all"},
+			},
+			apps_v1.DeploymentSpec{
+				Template: v1.PodTemplateSpec{
+					Spec: v1.PodSpec{
+						Containers: []v1.Container{
+							{Image: "gcr.io/v2-namespace/sidecar:1.0.0"},
+						},
+						Volumes: []v1.Volume{
+							{
+								Name: "oci-config",
+								VolumeSource: v1.VolumeSource{
+									Image: &v1.ImageVolumeSource{
+										Reference: "gcr.io/v2-namespace/hello-world:1.1.1",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			apps_v1.DeploymentStatus{},
+		},
+		{
+			meta_v1.TypeMeta{},
+			meta_v1.ObjectMeta{
+				Name:        "dep-without-annotation",
+				Namespace:   "xxxx",
+				Annotations: map[string]string{},
+				Labels:      map[string]string{types.KeelPolicyLabel: "all"},
+			},
+			apps_v1.DeploymentSpec{
+				Template: v1.PodTemplateSpec{
+					Spec: v1.PodSpec{
+						Containers: []v1.Container{
+							{Image: "gcr.io/v2-namespace/sidecar:1.0.0"},
+						},
+						Volumes: []v1.Volume{
+							{
+								Name: "oci-config",
+								VolumeSource: v1.VolumeSource{
+									Image: &v1.ImageVolumeSource{
+										Reference: "gcr.io/v2-namespace/hello-world:1.1.1",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			apps_v1.DeploymentStatus{},
+		},
+	}
+
+	grs := MustParseGRS(deps)
+	grc := &k8s.GenericResourceCache{}
+	grc.Add(grs...)
+
+	approver, teardown := approver()
+	defer teardown()
+	provider, err := NewProvider(fp, &fakeSender{}, approver, grc)
+	if err != nil {
+		t.Fatalf("failed to get provider: %s", err)
+	}
+
+	repo := &types.Repository{
+		Name: "gcr.io/v2-namespace/hello-world",
+		Tag:  "1.1.2",
+	}
+
+	plans, err := provider.createUpdatePlans(repo)
+	if err != nil {
+		t.Errorf("failed to get deployments: %s", err)
+	}
+
+	if len(plans) != 1 {
+		t.Fatalf("expected 1 update plan, got %d", len(plans))
+	}
+
+	if plans[0].Resource.Name != "dep-with-image-volume" {
+		t.Fatalf("unexpected resource updated: %s", plans[0].Resource.Name)
+	}
+
+	vols := plans[0].Resource.Volumes()
+	if len(vols) != 1 || vols[0].Image == nil {
+		t.Fatalf("expected one image volume, got %v", vols)
+	}
+	if got := vols[0].Image.Reference; got != "gcr.io/v2-namespace/hello-world:1.1.2" {
+		t.Errorf("expected updated image volume reference, got %s", got)
+	}
+}
+
+func TestTrackedImagesIncludeImageVolumes(t *testing.T) {
+	fp := &fakeImplementer{}
+	fp.namespaces = &v1.NamespaceList{
+		Items: []v1.Namespace{
+			{
+				meta_v1.TypeMeta{},
+				meta_v1.ObjectMeta{Name: "xxxx"},
+				v1.NamespaceSpec{},
+				v1.NamespaceStatus{},
+			},
+		},
+	}
+
+	dep := &apps_v1.Deployment{
+		meta_v1.TypeMeta{},
+		meta_v1.ObjectMeta{
+			Name:        "dep-1",
+			Namespace:   "xxxx",
+			Annotations: map[string]string{types.KeelImageVolumeAnnotation: "true"},
+			Labels:      map[string]string{types.KeelPolicyLabel: "all"},
+		},
+		apps_v1.DeploymentSpec{
+			Template: v1.PodTemplateSpec{
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{
+						{Image: "gcr.io/v2-namespace/sidecar:1.0.0"},
+					},
+					Volumes: []v1.Volume{
+						{
+							Name: "oci-config",
+							VolumeSource: v1.VolumeSource{
+								Image: &v1.ImageVolumeSource{
+									Reference: "gcr.io/v2-namespace/oci-config:1.0.0",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		apps_v1.DeploymentStatus{},
+	}
+
+	grs := MustParseGRS([]*apps_v1.Deployment{dep})
+	grc := &k8s.GenericResourceCache{}
+	grc.Add(grs...)
+
+	approver, teardown := approver()
+	defer teardown()
+	provider, err := NewProvider(fp, &fakeSender{}, approver, grc)
+	if err != nil {
+		t.Fatalf("failed to get provider: %s", err)
+	}
+
+	tracked, err := provider.TrackedImages()
+	if err != nil {
+		t.Fatalf("failed to get tracked images: %s", err)
+	}
+
+	found := false
+	for _, ti := range tracked {
+		if ti.Image.Remote() == "gcr.io/v2-namespace/oci-config:1.0.0" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected image volume reference to be tracked; got %v", tracked)
+	}
 }
 
 func TestGetImpactedPolicyAnnotations(t *testing.T) {
@@ -1716,5 +1912,83 @@ func TestTrackedInitImagesWithSecrets(t *testing.T) {
 	}
 	if imgs[0].Secrets[1] != "very-secret" {
 		t.Errorf("expected very-secret, got: %s", imgs[0].Secrets[1])
+	}
+}
+
+func TestTrackedImagesPollTagsAfterCurrent(t *testing.T) {
+	tests := []struct {
+		name        string
+		labels      map[string]string
+		annotations map[string]string
+		want        bool
+	}{
+		{name: "annotation", annotations: map[string]string{types.KeelPollTagsAfterCurrentAnnotation: "true"}, want: true},
+		{name: "label", labels: map[string]string{types.KeelPollTagsAfterCurrentAnnotation: "true"}, want: true},
+		{name: "disabled", annotations: map[string]string{types.KeelPollTagsAfterCurrentAnnotation: "false"}, want: false},
+		{name: "absent", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fp := &fakeImplementer{}
+			fp.namespaces = &v1.NamespaceList{
+				Items: []v1.Namespace{
+					{
+						meta_v1.TypeMeta{},
+						meta_v1.ObjectMeta{Name: "xxxx"},
+						v1.NamespaceSpec{},
+						v1.NamespaceStatus{},
+					},
+				},
+			}
+			labels := map[string]string{types.KeelPolicyLabel: "all"}
+			for k, v := range tt.labels {
+				labels[k] = v
+			}
+			deps := []*apps_v1.Deployment{
+				{
+					meta_v1.TypeMeta{},
+					meta_v1.ObjectMeta{
+						Name:        "dep-1",
+						Namespace:   "xxxx",
+						Labels:      labels,
+						Annotations: tt.annotations,
+					},
+					apps_v1.DeploymentSpec{
+						Template: v1.PodTemplateSpec{
+							Spec: v1.PodSpec{
+								Containers: []v1.Container{
+									{
+										Image: "ghcr.io/v2-namespace/hello-world:1.1.1",
+									},
+								},
+							},
+						},
+					},
+					apps_v1.DeploymentStatus{},
+				},
+			}
+
+			grc := &k8s.GenericResourceCache{}
+			grc.Add(MustParseGRS(deps)...)
+
+			approver, teardown := approver()
+			defer teardown()
+			provider, err := NewProvider(fp, &fakeSender{}, approver, grc)
+			if err != nil {
+				t.Fatalf("failed to get provider: %s", err)
+			}
+
+			imgs, err := provider.TrackedImages()
+			if err != nil {
+				t.Fatalf("failed to get images: %s", err)
+			}
+			if len(imgs) != 1 {
+				t.Fatalf("expected to find 1 image, got: %d", len(imgs))
+			}
+			if imgs[0].PollTagsAfterCurrent != tt.want {
+				t.Errorf("expected PollTagsAfterCurrent=%t, got %t", tt.want, imgs[0].PollTagsAfterCurrent)
+			}
+		})
 	}
 }

@@ -7,7 +7,6 @@ import (
 	"io"
 
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -45,8 +44,13 @@ type Opts struct {
 	Store store.Store
 
 	UIDir string
+	Debug bool
 
 	AuthenticatedWebhooks bool
+
+	AuthMode            auth.Mode
+	AuthProxyUserHeader string
+	AuthProxyLogoutURL  string
 }
 
 // TriggerServer - webhook trigger & healthcheck server
@@ -64,8 +68,12 @@ type TriggerServer struct {
 	authenticator auth.Authenticator
 
 	uiDir string
+	debug bool
 
 	authenticatedWebhooks bool
+	authMode              auth.Mode
+	authProxyUserHeader   string
+	authProxyLogoutURL    string
 }
 
 // NewTriggerServer - create new HTTP trigger based server
@@ -80,7 +88,11 @@ func NewTriggerServer(opts *Opts) *TriggerServer {
 		authenticator:         opts.Authenticator,
 		store:                 opts.Store,
 		uiDir:                 opts.UIDir,
+		debug:                 opts.Debug,
 		authenticatedWebhooks: opts.AuthenticatedWebhooks,
+		authMode:              opts.AuthMode,
+		authProxyUserHeader:   opts.AuthProxyUserHeader,
+		authProxyLogoutURL:    opts.AuthProxyLogoutURL,
 	}
 }
 
@@ -93,13 +105,17 @@ func (s *TriggerServer) Start() error {
 	n.Use(negroni.HandlerFunc(corsHeadersMiddleware))
 	n.UseHandler(s.router)
 
+	address := fmt.Sprintf(":%d", s.port)
+	if s.authMode == auth.ModeExternalProxy {
+		address = fmt.Sprintf("127.0.0.1:%d", s.port)
+	}
 	s.server = &http.Server{
-		Addr:    fmt.Sprintf("0.0.0.0:%d", s.port),
+		Addr:    address,
 		Handler: n,
 	}
 
 	log.WithFields(log.Fields{
-		"port": s.port,
+		"address": address,
 	}).Info("webhook trigger server starting...")
 
 	return s.server.ListenAndServe()
@@ -118,7 +134,7 @@ func getID(req *http.Request) string {
 
 func (s *TriggerServer) registerRoutes(mux *mux.Router) {
 
-	if os.Getenv("DEBUG") == "true" {
+	if s.debug {
 		DebugHandler{}.AddRoutes(mux)
 	}
 
@@ -131,14 +147,20 @@ func (s *TriggerServer) registerRoutes(mux *mux.Router) {
 
 	mux.Handle("/metrics", promhttp.Handler())
 
-	if s.authenticator.Enabled() {
+	if s.adminEnabled() {
 		log.Info("authentication enabled, setting up admin HTTP handlers")
 		// auth
-		mux.HandleFunc("/v1/auth/login", s.loginHandler).Methods("POST", "OPTIONS")
-		mux.HandleFunc("/v1/auth/info", s.requireAdminAuthorization(s.userInfoHandler)).Methods("GET", "OPTIONS")
-		mux.HandleFunc("/v1/auth/user", s.requireAdminAuthorization(s.userInfoHandler)).Methods("GET", "OPTIONS")
-		mux.HandleFunc("/v1/auth/logout", s.requireAdminAuthorization(s.logoutHandler)).Methods("POST", "GET", "OPTIONS")
-		mux.HandleFunc("/v1/auth/refresh", s.requireAdminAuthorization(s.refreshHandler)).Methods("GET", "OPTIONS")
+		if s.authMode != auth.ModeExternalProxy {
+			mux.HandleFunc("/v1/auth/login", s.loginHandler).Methods("POST", "OPTIONS")
+			mux.HandleFunc("/v1/auth/refresh", s.requireAdminAuthorization(s.refreshHandler)).Methods("GET", "OPTIONS")
+		} else {
+			mux.HandleFunc("/v1/auth/login", localAuthDisabledHandler).Methods("POST", "OPTIONS")
+			mux.HandleFunc("/v1/auth/refresh", localAuthDisabledHandler).Methods("GET", "OPTIONS")
+		}
+		mux.HandleFunc("/v1/auth/info", s.requireAdminAuthorization(s.authInfoHandler)).Methods("GET", "OPTIONS")
+		mux.HandleFunc("/v1/auth/user", s.requireAdminAuthorization(s.authUserHandler)).Methods("GET", "OPTIONS")
+		mux.HandleFunc("/v1/auth/logout", s.requireAdminAuthorization(s.logoutGetHandler)).Methods("GET", "OPTIONS")
+		mux.HandleFunc("/v1/auth/logout", s.requireAdminAuthorization(s.logoutPostHandler)).Methods("POST", "OPTIONS")
 
 		// approvals
 		mux.HandleFunc("/v1/approvals", s.requireAdminAuthorization(s.approvalsHandler)).Methods("GET", "OPTIONS")
@@ -162,11 +184,12 @@ func (s *TriggerServer) registerRoutes(mux *mux.Router) {
 
 		if s.uiDir != "" {
 			// Serve static assets directly.
-			mux.PathPrefix("/css/").Handler(http.FileServer(http.Dir(s.uiDir)))
-			mux.PathPrefix("/assets/").Handler(http.FileServer(http.Dir(s.uiDir)))
-			mux.PathPrefix("/js/").Handler(http.FileServer(http.Dir(s.uiDir)))
-			mux.PathPrefix("/img/").Handler(http.FileServer(http.Dir(s.uiDir)))
-			mux.PathPrefix("/loading/").Handler(http.FileServer(http.Dir(s.uiDir)))
+			assets := staticAssetHandler(s.uiDir)
+			mux.PathPrefix("/css/").Handler(assets)
+			mux.PathPrefix("/assets/").Handler(assets)
+			mux.PathPrefix("/js/").Handler(assets)
+			mux.PathPrefix("/img/").Handler(assets)
+			mux.PathPrefix("/loading/").Handler(assets)
 
 			mux.PathPrefix("/").HandlerFunc(indexHandler(s.uiDir))
 		}
@@ -174,6 +197,14 @@ func (s *TriggerServer) registerRoutes(mux *mux.Router) {
 		log.Info("authentication is not enabled, admin HTTP handlers are not initialized")
 	}
 
+}
+
+func (s *TriggerServer) adminEnabled() bool {
+	return s.authMode == auth.ModeExternalProxy || (s.authenticator != nil && s.authenticator.Enabled())
+}
+
+func localAuthDisabledHandler(resp http.ResponseWriter, _ *http.Request) {
+	http.Error(resp, "Keel local authentication is disabled in external-proxy mode", http.StatusNotFound)
 }
 
 func (s *TriggerServer) registerWebhookRoutes(mux *mux.Router) {
@@ -207,10 +238,26 @@ func (s *TriggerServer) registerWebhookRoutes(mux *mux.Router) {
 	}
 }
 
+// healthHandler reports whether the HTTP process is available.
+// @Summary Check service health
+// @Description Returns an empty 200 response while the Keel HTTP process is running.
+// @Tags System
+// @ID healthCheck
+// @Success 200 "Healthy"
+// @Router /healthz [get]
 func (s *TriggerServer) healthHandler(resp http.ResponseWriter, req *http.Request) {
 	resp.WriteHeader(http.StatusOK)
 }
 
+// versionHandler returns build and runtime version information.
+// @Summary Get Keel version
+// @Description Returns Keel build, API, Go runtime, operating system, and architecture information.
+// @Tags System
+// @ID getVersion
+// @Produce json
+// @Success 200 {object} types.VersionInfo
+// @Failure 500 "Version serialization failed"
+// @Router /version [get]
 func (s *TriggerServer) versionHandler(resp http.ResponseWriter, req *http.Request) {
 	v := version.GetKeelVersion()
 
@@ -296,6 +343,8 @@ type UserInfo struct {
 	LastLoginIP   string `json:"last_login_ip"`
 	LastLoginTime int64  `json:"last_login_time"`
 	RoleID        string `json:"role_id"`
+	AuthMode      string `json:"auth_mode,omitempty"`
+	LogoutURL     string `json:"logout_url,omitempty"`
 }
 
 func (s *TriggerServer) userInfoHandler(resp http.ResponseWriter, req *http.Request) {
@@ -310,9 +359,41 @@ func (s *TriggerServer) userInfoHandler(resp http.ResponseWriter, req *http.Requ
 		LastLoginIP:   "",
 		LastLoginTime: time.Now().Unix(),
 		RoleID:        "admin",
+		AuthMode:      string(s.authMode),
+		LogoutURL:     s.authProxyLogoutURL,
 	}
 
 	response(&ui, 200, nil, resp, req)
+}
+
+// authInfoHandler documents the auth info alias.
+// @Summary Get authentication info
+// @Description Returns the current administrator profile. This route exists only when the authenticator is enabled.
+// @Tags Auth
+// @ID getAuthInfo
+// @Produce json
+// @Security BasicAuth
+// @Security BearerAuth
+// @Success 200 {object} UserInfo
+// @Failure 401 {string} string "Unauthorized"
+// @Router /v1/auth/info [get]
+func (s *TriggerServer) authInfoHandler(resp http.ResponseWriter, req *http.Request) {
+	s.userInfoHandler(resp, req)
+}
+
+// authUserHandler documents the auth user alias.
+// @Summary Get current user
+// @Description Returns the current administrator profile. This route exists only when the authenticator is enabled.
+// @Tags Auth
+// @ID getAuthUser
+// @Produce json
+// @Security BasicAuth
+// @Security BearerAuth
+// @Success 200 {object} UserInfo
+// @Failure 401 {string} string "Unauthorized"
+// @Router /v1/auth/user [get]
+func (s *TriggerServer) authUserHandler(resp http.ResponseWriter, req *http.Request) {
+	s.userInfoHandler(resp, req)
 }
 
 type APIResponse struct {
@@ -321,8 +402,17 @@ type APIResponse struct {
 
 func indexHandler(uiDir string) func(w http.ResponseWriter, r *http.Request) {
 	fn := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache")
 		http.ServeFile(w, r, uiDir+"/index.html")
 	}
 
 	return http.HandlerFunc(fn)
+}
+
+func staticAssetHandler(uiDir string) http.Handler {
+	files := http.FileServer(http.Dir(uiDir))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		files.ServeHTTP(w, r)
+	})
 }
