@@ -3,7 +3,7 @@ package policy
 import (
 	"sort"
 
-	"github.com/Masterminds/semver"
+	"github.com/keel-hq/keel/util/version"
 	"github.com/keel-hq/keel/types"
 )
 
@@ -28,8 +28,8 @@ func (fp *ForcePolicy) ShouldUpdate(current, new string) (bool, error) {
 	}
 
 	if current != new {
-		currentVersion, currentErr := semver.NewVersion(current)
-		newVersion, newErr := semver.NewVersion(new)
+		currentVersion, currentErr := version.NewSemver(current)
+		newVersion, newErr := version.NewSemver(new)
 		if currentErr == nil && newErr == nil {
 			return newVersion.GreaterThan(currentVersion), nil
 		}
@@ -46,18 +46,18 @@ func (fp *ForcePolicy) ShouldUpdate(current, new string) (bool, error) {
 // would make the oldest tag in the repository win
 // (https://github.com/keel-hq/keel/issues/823).
 func (fp *ForcePolicy) Filter(tags []string) []string {
-	var versions []*semver.Version
+	var versions []*version.Semver
 	var others []string
 
 	for _, tag := range tags {
-		if v, err := semver.NewVersion(tag); err == nil {
+		if v, err := version.NewSemver(tag); err == nil {
 			versions = append(versions, v)
 		} else {
 			others = append(others, tag)
 		}
 	}
 
-	sort.Sort(sort.Reverse(semver.Collection(versions)))
+	sort.Sort(sort.Reverse(version.Collection(versions)))
 
 	filtered := make([]string, 0, len(tags))
 	for _, v := range versions {

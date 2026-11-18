@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Masterminds/semver"
+	"github.com/keel-hq/keel/util/version"
 	"github.com/rusenask/cron"
 
 	v1 "k8s.io/api/core/v1"
@@ -437,7 +437,7 @@ func (p *Provider) TrackedImages() ([]*types.TrackedImage, error) {
 
 			svp := make(map[string]string)
 
-			semverTag, err := semver.NewVersion(ref.Tag())
+			semverTag, err := version.NewSemver(ref.Tag())
 			if err == nil {
 				if semverTag.Prerelease() != "" {
 					svp[semverTag.Prerelease()] = ref.Tag()

@@ -36,7 +36,7 @@ func GetVersion(version string) (*types.Version, error) {
 		return nil, ErrNoMajorMinorPatchElementsFound
 	}
 
-	v, err := semver.NewVersion(version)
+	v, err := NewSemver(version)
 	if err != nil {
 		if err == semver.ErrInvalidSemVer {
 			return nil, ErrInvalidSemVer
@@ -48,6 +48,7 @@ func GetVersion(version string) (*types.Version, error) {
 		Major:      v.Major(),
 		Minor:      v.Minor(),
 		Patch:      v.Patch(),
+		Revision:   v.Revision(),
 		PreRelease: string(v.Prerelease()),
 		Metadata:   v.Metadata(),
 		Original:   v.Original(),
@@ -83,7 +84,7 @@ func GetImageNameAndVersion(name string) (string, *types.Version, error) {
 // and returns it as well as newAvailable bool
 func NewAvailable(current string, tags []string, matchPreRelease bool) (newVersion string, newAvailable bool, err error) {
 
-	currentVersion, err := semver.NewVersion(current)
+	currentVersion, err := NewSemver(current)
 	if err != nil {
 		return "", false, err
 	}
@@ -92,9 +93,9 @@ func NewAvailable(current string, tags []string, matchPreRelease bool) (newVersi
 		return "", false, nil
 	}
 
-	var vs []*semver.Version
+	var vs []*Semver
 	for _, r := range tags {
-		v, err := semver.NewVersion(r)
+		v, err := NewSemver(r)
 		if err != nil {
 			log.WithFields(log.Fields{
 				"error": err,
@@ -116,7 +117,7 @@ func NewAvailable(current string, tags []string, matchPreRelease bool) (newVersi
 		return "", false, nil
 	}
 
-	sort.Sort(sort.Reverse(semver.Collection(vs)))
+	sort.Sort(sort.Reverse(Collection(vs)))
 
 	if currentVersion.LessThan(vs[0]) {
 		log.WithFields(log.Fields{"currentVersion": currentVersion, "latestAvailable": vs[0]}).Debug("latest available is newer than current")
@@ -132,9 +133,9 @@ func Lowest(tags []string) string {
 		return ""
 	}
 
-	var vs []*semver.Version
+	var vs []*Semver
 	for _, r := range tags {
-		v, err := semver.NewVersion(r)
+		v, err := NewSemver(r)
 		if err != nil {
 			continue
 
@@ -152,7 +153,7 @@ func Lowest(tags []string) string {
 		return ""
 	}
 
-	sort.Sort(semver.Collection(vs))
+	sort.Sort(Collection(vs))
 
 	return vs[0].String()
 }
