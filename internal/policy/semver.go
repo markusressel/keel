@@ -8,7 +8,7 @@ import (
 
 	"github.com/keel-hq/keel/types"
 
-	"github.com/Masterminds/semver"
+	"github.com/keel-hq/keel/util/version"
 )
 
 // SemverPolicyType - policy type
@@ -78,12 +78,12 @@ func shouldUpdate(spt SemverPolicyType, matchPreRelease bool, current, new strin
 		return false, ErrNoMajorMinorPatchElementsFound
 	}
 
-	currentVersion, err := semver.NewVersion(current)
+	currentVersion, err := version.NewSemver(current)
 	if err != nil {
 		return false, fmt.Errorf("failed to parse current version: %s", err)
 	}
 
-	newVersion, err := semver.NewVersion(new)
+	newVersion, err := version.NewSemver(new)
 	if err != nil {
 		return false, fmt.Errorf("failed to parse new version: %s", err)
 	}
@@ -112,7 +112,7 @@ func shouldUpdate(spt SemverPolicyType, matchPreRelease bool, current, new strin
 }
 
 func (sp *SemverPolicy) Filter(tags []string) []string {
-	var versions []*semver.Version
+	var versions []*version.Semver
 	var filtered []string
 
 	for _, t := range tags {
@@ -120,7 +120,7 @@ func (sp *SemverPolicy) Filter(tags []string) []string {
 			// Keep only X.Y.Z+ semver
 			continue
 		}
-		v, err := semver.NewVersion(t)
+		v, err := version.NewSemver(t)
 		// Filter out non semver tags
 		if err != nil {
 			continue

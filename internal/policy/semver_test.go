@@ -277,3 +277,48 @@ func Test_shouldUpdate(t *testing.T) {
 		})
 	}
 }
+
+func TestSemverPolicyFourPartVersions(t *testing.T) {
+	tests := []struct {
+		name    string
+		spt     SemverPolicyType
+		current string
+		new     string
+		want    bool
+	}{
+		{"hotfix of the running patch, all", SemverPolicyTypeAll, "1.3.1", "1.3.1.1", true},
+		{"hotfix of the running patch, patch", SemverPolicyTypePatch, "1.3.1", "1.3.1.1", true},
+		{"hotfix of the running patch, minor", SemverPolicyTypeMinor, "1.3.1", "1.3.1.1", true},
+		{"next hotfix", SemverPolicyTypePatch, "1.2.5.6", "1.2.5.7", true},
+		{"older hotfix is no update", SemverPolicyTypeAll, "1.2.5.7", "1.2.5.6", false},
+		{"same version is no update", SemverPolicyTypeAll, "1.3.1.1", "1.3.1.1", false},
+		{"four part to next minor, minor policy", SemverPolicyTypeMinor, "1.2.5.6", "1.3.0", true},
+		{"four part to next minor, patch policy", SemverPolicyTypePatch, "1.2.5.6", "1.3.0", false},
+		{"four part to next major, minor policy", SemverPolicyTypeMinor, "1.3.1.1", "2.0.0", false},
+		{"four part to next major, major policy", SemverPolicyTypeMajor, "1.3.1.1", "2.0.0", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := NewSemverPolicy(tt.spt, false).ShouldUpdate(tt.current, tt.new)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("ShouldUpdate(%s, %s) = %v, want %v", tt.current, tt.new, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSemverPolicyFilterFourPartVersions(t *testing.T) {
+	got := NewSemverPolicy(SemverPolicyTypeAll, false).Filter([]string{"1.3.0", "1.3.1.1", "1.2.5.6", "latest", "1.3.1", "1.3.2"})
+	want := []string{"1.3.2", "1.3.1.1", "1.3.1", "1.3.0", "1.2.5.6"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	}
+}

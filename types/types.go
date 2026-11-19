@@ -152,9 +152,11 @@ func (e *Event) Scan(src interface{}) error {
 
 // Version - version container
 type Version struct {
-	Major      int64
-	Minor      int64
-	Patch      int64
+	Major int64
+	Minor int64
+	Patch int64
+	// Revision is the optional fourth number of X.Y.Z.R versions, 0 when there is none.
+	Revision   int64
 	PreRelease string
 	Metadata   string
 
@@ -168,6 +170,9 @@ func (v Version) String() string {
 	var buf bytes.Buffer
 
 	fmt.Fprintf(&buf, "%d.%d.%d", v.Major, v.Minor, v.Patch)
+	if v.Revision != 0 {
+		fmt.Fprintf(&buf, ".%d", v.Revision)
+	}
 	if v.PreRelease != "" {
 		fmt.Fprintf(&buf, "-%s", v.PreRelease)
 	}
