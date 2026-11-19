@@ -6,11 +6,13 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/keel-hq/keel/pkg/auth"
 	"github.com/keel-hq/keel/pkg/store"
 	"github.com/keel-hq/keel/types"
 )
 
-type approveRequest struct {
+// ApproveRequest changes the state of an existing approval.
+type ApproveRequest struct {
 	ID         string `json:"id"`
 	Voter      string `json:"voter"`
 	Identifier string `json:"identifier"`
@@ -25,6 +27,17 @@ const (
 	actionArchive = "archive"
 )
 
+// approvalsHandler lists approval records.
+// @Summary List approvals
+// @Description Lists active and archived approvals. This route exists only when the authenticator is enabled. Legacy store and serialization error paths write text with status 200.
+// @Tags Admin
+// @ID listApprovals
+// @Produce json
+// @Security BasicAuth
+// @Security BearerAuth
+// @Success 200 {array} types.Approval
+// @Failure 401 {string} string "Unauthorized"
+// @Router /v1/approvals [get]
 func (s *TriggerServer) approvalsHandler(resp http.ResponseWriter, req *http.Request) {
 
 	// lists all (both archived)
@@ -49,16 +62,34 @@ func (s *TriggerServer) approvalsHandler(resp http.ResponseWriter, req *http.Req
 	resp.Write(bts)
 }
 
-type resourceApprovalsUpdateRequest struct {
+// ResourceApprovalsUpdateRequest changes the required vote count for a resource.
+type ResourceApprovalsUpdateRequest struct {
 	Identifier    string `json:"identifier"`
 	Provider      string `json:"provider"`
 	VotesRequired int    `json:"votesRequired"`
 }
 
 // approvalSetHandler allows to set/remove approvals for resources
+// approvalSetHandler changes required resource approvals.
+// @Summary Set required approvals
+// @Description Sets a Kubernetes resource's required vote count. This route exists only when the authenticator is enabled.
+// @Tags Admin
+// @ID setResourceApprovals
+// @Accept json
+// @Produce json
+// @Security BasicAuth
+// @Security BearerAuth
+// @Param body body ResourceApprovalsUpdateRequest true "Approval requirement"
+// @Success 200 {object} APIResponse
+// @Failure 400 {string} string "Malformed or unsupported request"
+// @Failure 401 {string} string "Unauthorized"
+// @Failure 403 {string} string "Permission denied"
+// @Failure 404 {string} string "Resource not found"
+// @Failure 500 {string} string "Update failed"
+// @Router /v1/approvals [put]
 func (s *TriggerServer) approvalSetHandler(resp http.ResponseWriter, req *http.Request) {
 
-	var approvalUpdateRequest resourceApprovalsUpdateRequest
+	var approvalUpdateRequest ResourceApprovalsUpdateRequest
 	dec := json.NewDecoder(req.Body)
 	defer req.Body.Close()
 
@@ -74,9 +105,10 @@ func (s *TriggerServer) approvalSetHandler(resp http.ResponseWriter, req *http.R
 		return
 	}
 
+	providerType := types.ProviderTypeUnknown
 	switch approvalUpdateRequest.Provider {
 	case types.ProviderTypeKubernetes.String():
-		// ok
+		providerType = types.ProviderTypeKubernetes
 	default:
 		http.Error(resp, "unsupported provider", http.StatusBadRequest)
 		return
@@ -100,6 +132,13 @@ func (s *TriggerServer) approvalSetHandler(resp http.ResponseWriter, req *http.R
 			v.SetAnnotations(ann)
 
 			err := s.kubernetesClient.Update(v)
+			if err == nil {
+				err = s.approvalsManager.SetRequiredVotes(
+					approvalUpdateRequest.Identifier,
+					providerType,
+					approvalUpdateRequest.VotesRequired,
+				)
+			}
 
 			response(&APIResponse{Status: "updated"}, 200, err, resp, req)
 			return
@@ -110,9 +149,25 @@ func (s *TriggerServer) approvalSetHandler(resp http.ResponseWriter, req *http.R
 	fmt.Fprintf(resp, "resource with identifier '%s' not found", approvalUpdateRequest.Identifier)
 }
 
+// approvalApproveHandler applies an approval action.
+// @Summary Update an approval
+// @Description Approves, rejects, deletes, or archives an approval. Delete returns JSON null; legacy delete/archive error paths write text with status 200. This route exists only when the authenticator is enabled.
+// @Tags Admin
+// @ID updateApproval
+// @Accept json
+// @Produce json
+// @Security BasicAuth
+// @Security BearerAuth
+// @Param body body ApproveRequest true "Approval action"
+// @Success 200 {object} types.Approval
+// @Failure 400 {string} string "Malformed request"
+// @Failure 401 {string} string "Unauthorized"
+// @Failure 404 {string} string "Approval not found"
+// @Failure 500 {string} string "Approval update failed"
+// @Router /v1/approvals [post]
 func (s *TriggerServer) approvalApproveHandler(resp http.ResponseWriter, req *http.Request) {
 
-	var ar approveRequest
+	var ar ApproveRequest
 	dec := json.NewDecoder(req.Body)
 	defer req.Body.Close()
 
@@ -126,6 +181,9 @@ func (s *TriggerServer) approvalApproveHandler(resp http.ResponseWriter, req *ht
 	if ar.Identifier == "" {
 		http.Error(resp, "identifier cannot be empty", http.StatusNotFound)
 		return
+	}
+	if s.authMode == auth.ModeExternalProxy {
+		ar.Voter = s.approvalVoter(req, ar.Voter)
 	}
 
 	var approval *types.Approval
@@ -203,4 +261,13 @@ func (s *TriggerServer) approvalApproveHandler(resp http.ResponseWriter, req *ht
 	}
 
 	resp.Write(bts)
+}
+
+func (s *TriggerServer) approvalVoter(req *http.Request, requested string) string {
+	if s.authMode == auth.ModeExternalProxy {
+		if user := auth.GetAccountFromCtx(req.Context()); user != nil && user.Username != "" {
+			return user.Username
+		}
+	}
+	return requested
 }

@@ -1,0 +1,63 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: keel
+rules:
+  # Keel inspects the cluster it runs in to find the workloads it manages.
+  - apiGroups:
+      - ""
+    resources:
+      - namespaces
+      - nodes
+    verbs:
+      - get
+      - watch
+      - list
+  # Needed only with the Helm provider (HELM3_PROVIDER="true"): the Helm SDK keeps
+  # release state in Secrets (the default driver) and reads it with these verbs.
+  # Keel itself never reads secrets — set HELM3_PROVIDER="false" and drop this rule
+  # if the cluster has no Helm releases.
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - get
+      - watch
+      - list
+  # The workloads Keel watches and rewrites images on. The empty string is the core
+  # API group and must stay: pods and replicationcontrollers belong to it, and Keel
+  # lists pods to corroborate rollout scheduling and deletes them when an approval
+  # tells it to (provider/kubernetes/implementer.go).
+  - apiGroups:
+      - ""
+      - extensions
+      - apps
+      - batch
+    resources:
+      - pods
+      - replicasets
+      - replicationcontrollers
+      - statefulsets
+      - deployments
+      - daemonsets
+      - jobs
+      - cronjobs
+    verbs:
+      - get
+      - delete
+      - watch
+      - list
+      - update
+  # Only needed with the Helm provider and HELM_DRIVER="configmaps", where Helm
+  # writes release state back to config maps. The chart's equivalent rule also
+  # grants pods/portforward, which this Keel version never calls, so it is omitted
+  # here.
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    verbs:
+      - get
+      - create
+      - update

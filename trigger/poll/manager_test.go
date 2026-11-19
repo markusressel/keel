@@ -2,10 +2,11 @@ package poll
 
 import (
 	"context"
-	"io/ioutil"
+	"github.com/keel-hq/keel/internal/policy"
 	"log"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/keel-hq/keel/approvals"
 	"github.com/keel-hq/keel/pkg/store/sql"
@@ -22,6 +23,23 @@ import (
 	"testing"
 )
 
+func TestPollManagerScanInterval(t *testing.T) {
+	defaultManager := NewPollManager(nil, nil)
+	if defaultManager.scanInterval != time.Minute {
+		t.Fatalf("expected default scan interval %s, got %s", time.Minute, defaultManager.scanInterval)
+	}
+
+	customManager := NewPollManager(nil, nil, 15*time.Second)
+	if customManager.scanInterval != 15*time.Second {
+		t.Fatalf("expected custom scan interval %s, got %s", 15*time.Second, customManager.scanInterval)
+	}
+
+	invalidManager := NewPollManager(nil, nil, 0)
+	if invalidManager.scanInterval != time.Minute {
+		t.Fatalf("expected invalid interval to use default %s, got %s", time.Minute, invalidManager.scanInterval)
+	}
+}
+
 type FakeSecretsGetter struct {
 }
 
@@ -30,7 +48,7 @@ func (g *FakeSecretsGetter) Get(image *types.TrackedImage) (*types.Credentials, 
 }
 
 func newTestingUtils() (*sql.SQLStore, func()) {
-	dir, err := ioutil.TempDir("", "whstoretest")
+	dir, err := os.MkdirTemp("", "whstoretest")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -60,6 +78,7 @@ func TestCheckDeployment(t *testing.T) {
 				Trigger:      types.TriggerTypePoll,
 				Provider:     "fp",
 				PollSchedule: types.KeelPollDefaultSchedule,
+				Policy:       policy.LegacyPolicyPopulate(imgA),
 			},
 
 			{
@@ -67,6 +86,7 @@ func TestCheckDeployment(t *testing.T) {
 				Image:        imgB,
 				Provider:     "fp",
 				PollSchedule: types.KeelPollDefaultSchedule,
+				Policy:       policy.LegacyPolicyPopulate(imgB),
 			},
 		},
 	}

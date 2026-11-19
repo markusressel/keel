@@ -1,0 +1,88 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keel
+  namespace: keel
+  labels:
+    app: keel
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: keel
+  template:
+    metadata:
+      labels:
+        app: keel
+    spec:
+      serviceAccountName: keel
+      containers:
+        - name: keel
+          # Pinned to the release chart/keel currently declares as appVersion in
+          # chart/keel/Chart.yaml — check there (or the GitHub releases page) for
+          # the newest version. A `nightly` tag exists on ghcr.io/keel-hq/keel
+          # and keelhq/keel, but it is a pre-release and is not supported in
+          # production.
+          image: "ghcr.io/keel-hq/keel:0.22.3"
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/keel"]
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: AUTH_MODE
+              value: "legacy"
+            # Basic Auth username for the Admin UI and API. Keel requires
+            # BASIC_AUTH_USER and BASIC_AUTH_PASSWORD to be set together or both
+            # unset, so this must stay paired with BASIC_AUTH_PASSWORD in
+            # 20-secret.yaml. To turn off Basic Auth, delete this variable *and*
+            # the envFrom block below, then redeploy.
+            - name: BASIC_AUTH_USER
+              value: "admin"
+            - name: POLL
+              value: "true"
+            - name: POLL_DEFAULTSCHEDULE
+              value: "@every 1m"
+            # Tracks images of Helm releases. Set to "false" if this cluster has
+            # no Helm releases; image polling and the Kubernetes provider are
+            # unaffected.
+            - name: HELM3_PROVIDER
+              value: "true"
+            - name: NOTIFICATION_LEVEL
+              value: "info"
+          # Supplies BASIC_AUTH_PASSWORD (and any other secrets Keel reads from
+          # the environment). Remove this block only together with
+          # BASIC_AUTH_USER above.
+          envFrom:
+            - secretRef:
+                name: keel
+          ports:
+            - containerPort: 9300
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 9300
+            initialDelaySeconds: 0
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9300
+            initialDelaySeconds: 5
+            timeoutSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 9300
+            initialDelaySeconds: 5
+            timeoutSeconds: 10
+          resources:
+            limits:
+              cpu: 100m
+              memory: 128Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi

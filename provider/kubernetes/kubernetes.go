@@ -1,9 +1,12 @@
 package kubernetes
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Masterminds/semver"
@@ -15,8 +18,10 @@ import (
 
 	"github.com/keel-hq/keel/approvals"
 	"github.com/keel-hq/keel/extension/notification"
+	"github.com/keel-hq/keel/internal/concurrent"
 	"github.com/keel-hq/keel/internal/k8s"
 	"github.com/keel-hq/keel/internal/policy"
+	"github.com/keel-hq/keel/pkg/config"
 	"github.com/keel-hq/keel/types"
 	"github.com/keel-hq/keel/util/image"
 	"github.com/keel-hq/keel/util/policies"
@@ -40,9 +45,35 @@ var kubernetesUnversionedUpdatesCounter = prometheus.NewCounterVec(
 	[]string{"kubernetes"},
 )
 
+var eventBufferBackpressureCounter = prometheus.NewCounter(
+	prometheus.CounterOpts{
+		Name: "kubernetes_provider_event_buffer_backpressure_total",
+		Help: "How many times an event submit had to wait because the kubernetes provider event buffer was full.",
+	},
+)
+
+// concurrentPlanWorkers bounds how many deployments of a single event are
+// updated in parallel. Events stay processed one at a time, but within an
+// event each deployment update runs independently, so one slow deployment
+// cannot hold up the others (keel-hq/keel#443).
+const concurrentPlanWorkers = 10
+
+// backpressureLogInterval limits how often a saturated buffer is logged.
+const backpressureLogInterval = 5 * time.Second
+
+// lastBackpressureLogNS is the last time a saturated-buffer warning was
+// logged (unix nanos).
+var lastBackpressureLogNS atomic.Int64
+
+// ErrProviderStopped is returned by Submit when the provider has already
+// stopped, so callers fail fast instead of blocking on a channel nobody
+// drains.
+var ErrProviderStopped = errors.New("provider is stopped")
+
 func init() {
 	prometheus.MustRegister(kubernetesVersionedUpdatesCounter)
 	prometheus.MustRegister(kubernetesUnversionedUpdatesCounter)
+	prometheus.MustRegister(eventBufferBackpressureCounter)
 }
 
 // ProviderName - provider name
@@ -70,6 +101,14 @@ type UpdatePlan struct {
 	CurrentVersion string
 	// New version that's already in the deployment
 	NewVersion string
+	// Current digest of the image being replaced, known when observable
+	// (running pods or keel.sh/digest annotation), empty otherwise
+	CurrentDigest string
+	// New digest taken from the event repository, empty when the trigger
+	// did not provide one
+	NewDigest string
+	// Image identifies the repository and tag to which NewDigest belongs.
+	Image string
 }
 
 func (p *UpdatePlan) String() string {
@@ -79,9 +118,38 @@ func (p *UpdatePlan) String() string {
 	return "empty plan"
 }
 
+// formatVersionWithDigest renders a version for notification messages,
+// appending the image digest when known. It makes tag updates that keep the
+// same tag (e.g. latest -> latest) identifiable by the image hash they move.
+func formatVersionWithDigest(version, digest string) string {
+	if digest == "" {
+		return version
+	}
+	return fmt.Sprintf("%s (%s)", version, digest)
+}
+
+// updateMetadata builds notification metadata for a resource update,
+// carrying the image digests alongside the identity fields when known.
+func updateMetadata(resource *k8s.GenericResource, plan *UpdatePlan, providerName string) map[string]string {
+	metadata := map[string]string{
+		"provider":  providerName,
+		"namespace": resource.GetNamespace(),
+		"name":      resource.GetName(),
+	}
+	if plan.CurrentDigest != "" {
+		metadata["previousDigest"] = plan.CurrentDigest
+	}
+	if plan.NewDigest != "" {
+		metadata["newDigest"] = plan.NewDigest
+	}
+	return metadata
+}
+
 // Provider - kubernetes provider for auto update
 type Provider struct {
-	implementer Implementer
+	implementer    Implementer
+	platforms      *k8s.PlatformResolver
+	runningDigests *k8s.RunningDigestResolver
 
 	sender notification.Sender
 
@@ -94,21 +162,73 @@ type Provider struct {
 }
 
 // NewProvider - create new kubernetes based provider
-func NewProvider(implementer Implementer, sender notification.Sender, approvalManager approvals.Manager, cache GenericResourceCache) (*Provider, error) {
+func NewProvider(implementer Implementer, sender notification.Sender, approvalManager approvals.Manager, cache GenericResourceCache, resolvers ...*k8s.PlatformResolver) (*Provider, error) {
+	platforms := k8s.NewPlatformResolver(implementer)
+	if len(resolvers) > 0 && resolvers[0] != nil {
+		platforms = resolvers[0]
+	}
 	return &Provider{
 		implementer:     implementer,
+		platforms:       platforms,
+		runningDigests:  k8s.NewRunningDigestResolver(implementer),
 		cache:           cache,
 		approvalManager: approvalManager,
-		events:          make(chan *types.Event, 100),
+		events:          make(chan *types.Event, config.DefaultEventBufferSize),
 		stop:            make(chan struct{}),
 		sender:          sender,
 	}, nil
 }
 
-// Submit - submit event to provider
+// Submit - submit event to provider. Submit never drops an event: when the
+// buffer is full it applies backpressure (the call blocks) and logs the
+// saturation so a stalled pipeline is visible instead of silently delaying
+// or losing updates.
 func (p *Provider) Submit(event types.Event) error {
-	p.events <- &event
-	return nil
+	select {
+	case <-p.stop:
+		return ErrProviderStopped
+	default:
+	}
+	select {
+	case p.events <- &event:
+		return nil
+	case <-p.stop:
+		return ErrProviderStopped
+	default:
+	}
+
+	// The buffer is full. Retain the event and apply backpressure: wait for
+	// the consumer to drain a slot instead of dropping or delaying the
+	// trigger in silence.
+	eventBufferBackpressureCounter.Inc()
+	logBackpressure(&event, p)
+
+	select {
+	case p.events <- &event:
+		return nil
+	case <-p.stop:
+		return ErrProviderStopped
+	}
+}
+
+func logBackpressure(event *types.Event, p *Provider) {
+	now := time.Now().UnixNano()
+	for {
+		last := lastBackpressureLogNS.Load()
+		if last != 0 && now-last < int64(backpressureLogInterval) {
+			return
+		}
+		if lastBackpressureLogNS.CompareAndSwap(last, now) {
+			log.WithFields(log.Fields{
+				"context":           "provider.kubernetes",
+				"image":             event.Repository.Name,
+				"tag":               event.Repository.Tag,
+				"trigger":           event.TriggerName,
+				"event_buffer_size": cap(p.events),
+			}).Warn("event buffer saturated; applying backpressure (event retained, not dropped)")
+			return
+		}
+	}
 }
 
 // GetName - get provider name
@@ -145,9 +265,63 @@ func getImagePullSecretFromMeta(labels map[string]string, annotations map[string
 	return ""
 }
 
-func getInitContainerTrackingFromMeta(labels map[string]string, annotations map[string]string) bool {
+func GetMonitorContainersFromMeta(labels map[string]string, annotations map[string]string) k8s.ContainerFilter {
+	monitorContainersRegex := getMonitorContainersFromMeta(labels, annotations)
+	filterFunc := func(container v1.Container) bool {
+		return monitorContainersRegex.MatchString(container.Name)
+	}
+	return filterFunc
+}
 
-	searchKey := strings.ToLower(types.KeelInitContainerAnnotation)
+/**
+ *
+ */
+func getMonitorContainersFromMeta(labels map[string]string, annotations map[string]string) *regexp.Regexp {
+
+	searchKey := strings.ToLower(types.KeelMonitorContainers)
+
+	for k, v := range labels {
+		if strings.ToLower(k) == searchKey {
+			result, err := regexp.Compile(v)
+			if err != nil {
+				log.WithFields(log.Fields{
+					"error": err,
+					"regex": v,
+				}).Error("provider.kubernetes: failed to parse regular expression.")
+				continue
+			}
+			return result
+		}
+	}
+
+	for k, v := range annotations {
+		if strings.ToLower(k) == searchKey {
+			result, err := regexp.Compile(v)
+			if err != nil {
+				log.WithFields(log.Fields{
+					"error": err,
+					"regex": v,
+				}).Error("provider.kubernetes: failed to parse regular expression.")
+				continue
+			}
+			return result
+		}
+	}
+
+	return regexp.MustCompile(".*") // Match all to preserve previous behavior
+}
+
+func getInitContainerTrackingFromMeta(labels map[string]string, annotations map[string]string) bool {
+	return getBoolFromMeta(types.KeelInitContainerAnnotation, labels, annotations)
+}
+
+func getPollTagsAfterCurrentFromMeta(labels map[string]string, annotations map[string]string) bool {
+	return getBoolFromMeta(types.KeelPollTagsAfterCurrentAnnotation, labels, annotations)
+}
+
+func getBoolFromMeta(key string, labels map[string]string, annotations map[string]string) bool {
+
+	searchKey := strings.ToLower(key)
 
 	for k, v := range labels {
 		if strings.ToLower(k) == searchKey {
@@ -164,17 +338,47 @@ func getInitContainerTrackingFromMeta(labels map[string]string, annotations map[
 	return false
 }
 
+func getImageVolumeTrackingFromMeta(labels map[string]string, annotations map[string]string) bool {
+
+	searchKey := strings.ToLower(types.KeelImageVolumeAnnotation)
+
+	for k, v := range labels {
+		if strings.ToLower(k) == searchKey {
+			return v == "true"
+		}
+	}
+
+	for k, v := range annotations {
+		if strings.ToLower(k) == searchKey {
+			return v == "true"
+		}
+	}
+
+	return false
+}
+
+// GetMonitorVolumesFromMeta returns a VolumeFilter that matches volume names
+// against the keel.sh/monitorContainers regex (shared with containers so a
+// single annotation governs all image references on the resource).
+func GetMonitorVolumesFromMeta(labels map[string]string, annotations map[string]string) k8s.VolumeFilter {
+	monitorRegex := getMonitorContainersFromMeta(labels, annotations)
+	return func(volume v1.Volume) bool {
+		return monitorRegex.MatchString(volume.Name)
+	}
+}
+
 // TrackedImages returns a list of tracked images.
 func (p *Provider) TrackedImages() ([]*types.TrackedImage, error) {
 	var trackedImages []*types.TrackedImage
 
 	for _, gr := range p.cache.Values() {
+
 		labels := gr.GetLabels()
 		annotations := gr.GetAnnotations()
 
 		// ignoring unlabelled deployments
 		plc := policy.GetPolicyFromLabelsOrAnnotations(labels, annotations)
-		if plc.Type() == policy.PolicyTypeNone {
+		if plc.Type() == types.PolicyTypeNone {
 			continue
 		}
 
@@ -205,10 +409,20 @@ func (p *Provider) TrackedImages() ([]*types.TrackedImage, error) {
 		}
 		secrets = append(secrets, gr.GetImagePullSecrets()...)
 
-		images := gr.GetImages()
+		filterFunc := GetMonitorContainersFromMeta(annotations, labels)
+
+		images := gr.GetImages(filterFunc)
 		if getInitContainerTrackingFromMeta(labels, annotations) {
-			images = append(images, gr.GetInitImages()...)
+			images = append(images, gr.GetInitImages(filterFunc)...)
 		}
+		if getImageVolumeTrackingFromMeta(labels, annotations) {
+			volumeFilter := GetMonitorVolumesFromMeta(annotations, labels)
+			images = append(images, gr.GetImageVolumeReferences(volumeFilter)...)
+		}
+		platforms, platformErr := p.platforms.Resolve(gr)
+		runningDigests := p.runningDigests.Resolve(gr)
+		pollTagsAfterCurrent := getPollTagsAfterCurrentFromMeta(labels, annotations)
+
 		for _, img := range images {
 			ref, err := image.Parse(img)
 			if err != nil {
@@ -220,6 +434,7 @@ func (p *Provider) TrackedImages() ([]*types.TrackedImage, error) {
 				}).Error("provider.kubernetes: failed to parse image")
 				continue
 			}
+
 			svp := make(map[string]string)
 
 			semverTag, err := semver.NewVersion(ref.Tag())
@@ -230,14 +445,19 @@ func (p *Provider) TrackedImages() ([]*types.TrackedImage, error) {
 			}
 
 			trackedImages = append(trackedImages, &types.TrackedImage{
-				Image:        ref,
-				PollSchedule: schedule,
-				Trigger:      trigger,
-				Provider:     ProviderName,
-				Namespace:    gr.Namespace,
-				Secrets:      secrets,
-				Meta:         make(map[string]string),
-				Policy:       plc,
+				Image:          ref,
+				RunningDigests: runningDigests[img],
+				PollSchedule:   schedule,
+				Trigger:        trigger,
+				Provider:       ProviderName,
+				Namespace:      gr.Namespace,
+				Secrets:        secrets,
+				Meta:           make(map[string]string),
+				Platforms:      platforms,
+				PlatformErr:    platformErr,
+				Policy:         plc,
+
+				PollTagsAfterCurrent: pollTagsAfterCurrent,
 			})
 		}
 	}
@@ -246,6 +466,11 @@ func (p *Provider) TrackedImages() ([]*types.TrackedImage, error) {
 }
 
 func (p *Provider) startInternal() error {
+	log.WithFields(log.Fields{
+		"context":           "provider.kubernetes",
+		"event_buffer_size": cap(p.events),
+	}).Info("provider.kubernetes: starting event loop")
+
 	for {
 		select {
 		case event := <-p.events:
@@ -265,7 +490,7 @@ func (p *Provider) startInternal() error {
 }
 
 func (p *Provider) processEvent(event *types.Event) (updated []*k8s.GenericResource, err error) {
-	plans, err := p.createUpdatePlans(&event.Repository)
+	plans, err := p.createUpdatePlansForEvent(event)
 	if err != nil {
 		return nil, err
 	}
@@ -283,122 +508,154 @@ func (p *Provider) processEvent(event *types.Event) (updated []*k8s.GenericResou
 	return p.updateDeployments(approvedPlans)
 }
 
+// updateDeployments applies every update plan of a single event. Each plan
+// targets a distinct resource, so the plans are handed to a bounded worker
+// pool instead of being applied one after another: a slow deployment update
+// no longer delays the rest of the event (keel-hq/keel#443). Events
+// themselves are still processed one at a time, so ordering is preserved.
 func (p *Provider) updateDeployments(plans []*UpdatePlan) (updated []*k8s.GenericResource, err error) {
-	for _, plan := range plans {
-		resource := plan.Resource
+	updated = make([]*k8s.GenericResource, 0, len(plans))
+	if len(plans) == 0 {
+		return updated, nil
+	}
 
-		annotations := resource.GetAnnotations()
+	var mu sync.Mutex
+	concurrent.Run(concurrentPlanWorkers, len(plans), func(i int) {
+		if r := p.applyPlan(plans[i]); r != nil {
+			mu.Lock()
+			updated = append(updated, r)
+			mu.Unlock()
+		}
+	})
 
-		notificationChannels := types.ParseEventNotificationChannels(annotations)
+	return updated, nil
+}
+
+// applyPlan applies a single update plan to its resource and sends the
+// surrounding notifications. It returns the updated resource, or nil when
+// the update failed.
+func (p *Provider) applyPlan(plan *UpdatePlan) *k8s.GenericResource {
+	resource := plan.Resource
+
+	annotations := resource.GetAnnotations()
+	labels := resource.GetLabels()
+
+	notificationChannels := types.ParseEventNotificationChannels(annotations)
+	containerFilterFunction := GetMonitorContainersFromMeta(labels, annotations)
+	trackInitContainers := getInitContainerTrackingFromMeta(labels, annotations)
+	trackImageVolumes := getImageVolumeTrackingFromMeta(labels, annotations)
+
+	images := resource.GetImages(containerFilterFunction)
+	if trackInitContainers {
+		images = append(images, resource.GetInitImages(containerFilterFunction)...)
+	}
+	if trackImageVolumes {
+		images = append(images, resource.GetImageVolumeReferences(GetMonitorVolumesFromMeta(labels, annotations))...)
+	}
+
+	currentVersion := formatVersionWithDigest(plan.CurrentVersion, plan.CurrentDigest)
+	newVersion := formatVersionWithDigest(plan.NewVersion, plan.NewDigest)
+
+	p.sender.Send(types.EventNotification{
+		ResourceKind: resource.Kind(),
+		Identifier:   resource.Identifier,
+		Name:         "preparing to update resource",
+		Message:      fmt.Sprintf("Preparing to update %s %s/%s %s->%s (%s)", resource.Kind(), resource.Namespace, resource.Name, currentVersion, newVersion, strings.Join(images, ", ")),
+		CreatedAt:    time.Now(),
+		Type:         types.NotificationPreDeploymentUpdate,
+		Level:        types.LevelDebug,
+		Channels:     notificationChannels,
+		Metadata:     updateMetadata(resource, plan, p.GetName()),
+	})
+
+	timestamp := time.Now().Format(time.RFC3339)
+	annotations["kubernetes.io/change-cause"] = fmt.Sprintf("keel automated update, version %s -> %s [%s]", currentVersion, newVersion, timestamp)
+
+	// record the digest keel is deploying so the next update can report
+	// the previous image hash too (e.g. latest (x) -> latest (y))
+	if plan.NewDigest != "" {
+		annotations[types.KeelDigestAnnotation] = plan.NewDigest
+	} else {
+		delete(annotations, types.KeelDigestAnnotation)
+	}
+
+	resource.SetAnnotations(annotations)
+	recordDeployedDigest(resource, plan)
+
+	err := p.implementer.Update(resource)
+	kubernetesVersionedUpdatesCounter.With(prometheus.Labels{"kubernetes": fmt.Sprintf("%s/%s", resource.Namespace, resource.Name)}).Inc()
+	if err != nil {
+		log.WithFields(log.Fields{
+			"error":      err,
+			"namespace":  resource.Namespace,
+			"deployment": resource.Name,
+			"kind":       resource.Kind(),
+			"update":     fmt.Sprintf("%s->%s", currentVersion, newVersion),
+		}).Error("provider.kubernetes: got error while updating resource")
 
 		p.sender.Send(types.EventNotification{
-			ResourceKind: resource.Kind(),
-			Identifier:   resource.Identifier,
-			Name:         "preparing to update resource",
-			Message:      fmt.Sprintf("Preparing to update %s %s/%s %s->%s (%s)", resource.Kind(), resource.Namespace, resource.Name, plan.CurrentVersion, plan.NewVersion, strings.Join(resource.GetImages(), ", ")),
-			CreatedAt:    time.Now(),
-			Type:         types.NotificationPreDeploymentUpdate,
-			Level:        types.LevelDebug,
-			Channels:     notificationChannels,
-			Metadata: map[string]string{
-				"provider":  p.GetName(),
-				"namespace": resource.GetNamespace(),
-				"name":      resource.GetName(),
-			},
-		})
-
-		var err error
-
-		timestamp := time.Now().Format(time.RFC3339)
-		annotations["kubernetes.io/change-cause"] = fmt.Sprintf("keel automated update, version %s -> %s [%s]", plan.CurrentVersion, plan.NewVersion, timestamp)
-
-		resource.SetAnnotations(annotations)
-
-		err = p.implementer.Update(resource)
-		kubernetesVersionedUpdatesCounter.With(prometheus.Labels{"kubernetes": fmt.Sprintf("%s/%s", resource.Namespace, resource.Name)}).Inc()
-		if err != nil {
-			log.WithFields(log.Fields{
-				"error":      err,
-				"namespace":  resource.Namespace,
-				"deployment": resource.Name,
-				"kind":       resource.Kind(),
-				"update":     fmt.Sprintf("%s->%s", plan.CurrentVersion, plan.NewVersion),
-			}).Error("provider.kubernetes: got error while updating resource")
-
-			p.sender.Send(types.EventNotification{
-				Name:         "update resource",
-				ResourceKind: resource.Kind(),
-				Identifier:   resource.Identifier,
-				Message:      fmt.Sprintf("%s %s/%s update %s->%s failed, error: %s", resource.Kind(), resource.Namespace, resource.Name, plan.CurrentVersion, plan.NewVersion, err),
-				CreatedAt:    time.Now(),
-				Type:         types.NotificationDeploymentUpdate,
-				Level:        types.LevelError,
-				Channels:     notificationChannels,
-				Metadata: map[string]string{
-					"provider":  p.GetName(),
-					"namespace": resource.GetNamespace(),
-					"name":      resource.GetName(),
-				},
-			})
-
-			continue
-		}
-
-		err = p.updateComplete(plan)
-		if err != nil {
-			log.WithFields(log.Fields{
-				"error":     err,
-				"name":      resource.Name,
-				"kind":      resource.Kind(),
-				"namespace": resource.Namespace,
-			}).Warn("provider.kubernetes: got error while archiving approvals counter after successful update")
-		}
-
-		var msg string
-		releaseNotes := types.ParseReleaseNotesURL(resource.GetAnnotations())
-		if releaseNotes != "" {
-			msg = fmt.Sprintf("Successfully updated %s %s/%s %s->%s (%s). Release notes: %s", resource.Kind(), resource.Namespace, resource.Name, plan.CurrentVersion, plan.NewVersion, strings.Join(resource.GetImages(), ", "), releaseNotes)
-		} else {
-			msg = fmt.Sprintf("Successfully updated %s %s/%s %s->%s (%s)", resource.Kind(), resource.Namespace, resource.Name, plan.CurrentVersion, plan.NewVersion, strings.Join(resource.GetImages(), ", "))
-		}
-
-		err = p.sender.Send(types.EventNotification{
-			ResourceKind: resource.Kind(),
-			Identifier:   resource.Identifier,
 			Name:         "update resource",
-			Message:      msg,
+			ResourceKind: resource.Kind(),
+			Identifier:   resource.Identifier,
+			Message:      fmt.Sprintf("%s %s/%s update %s->%s failed, error: %s", resource.Kind(), resource.Namespace, resource.Name, currentVersion, newVersion, err),
 			CreatedAt:    time.Now(),
 			Type:         types.NotificationDeploymentUpdate,
-			Level:        types.LevelSuccess,
+			Level:        types.LevelError,
 			Channels:     notificationChannels,
-			Metadata: map[string]string{
-				"provider":  p.GetName(),
-				"namespace": resource.GetNamespace(),
-				"name":      resource.GetName(),
-			},
+			Metadata:     updateMetadata(resource, plan, p.GetName()),
 		})
-		if err != nil {
-			log.WithFields(log.Fields{
-				"error":     err,
-				"name":      resource.Name,
-				"kind":      resource.Kind(),
-				"previous":  plan.CurrentVersion,
-				"new":       plan.NewVersion,
-				"namespace": resource.Namespace,
-			}).Error("provider.kubernetes: got error while sending notification")
-		}
 
+		return nil
+	}
+
+	if err := p.updateComplete(plan); err != nil {
 		log.WithFields(log.Fields{
+			"error":     err,
+			"name":      resource.Name,
+			"kind":      resource.Kind(),
+			"namespace": resource.Namespace,
+		}).Warn("provider.kubernetes: got error while archiving approvals counter after successful update")
+	}
+
+	var msg string
+	releaseNotes := types.ParseReleaseNotesURL(resource.GetAnnotations())
+	if releaseNotes != "" {
+		msg = fmt.Sprintf("Successfully updated %s %s/%s %s->%s (%s). Release notes: %s", resource.Kind(), resource.Namespace, resource.Name, currentVersion, newVersion, strings.Join(images, ", "), releaseNotes)
+	} else {
+		msg = fmt.Sprintf("Successfully updated %s %s/%s %s->%s (%s)", resource.Kind(), resource.Namespace, resource.Name, currentVersion, newVersion, strings.Join(images, ", "))
+	}
+
+	if err := p.sender.Send(types.EventNotification{
+		ResourceKind: resource.Kind(),
+		Identifier:   resource.Identifier,
+		Name:         "update resource",
+		Message:      msg,
+		CreatedAt:    time.Now(),
+		Type:         types.NotificationDeploymentUpdate,
+		Level:        types.LevelSuccess,
+		Channels:     notificationChannels,
+		Metadata:     updateMetadata(resource, plan, p.GetName()),
+	}); err != nil {
+		log.WithFields(log.Fields{
+			"error":     err,
 			"name":      resource.Name,
 			"kind":      resource.Kind(),
 			"previous":  plan.CurrentVersion,
 			"new":       plan.NewVersion,
 			"namespace": resource.Namespace,
-		}).Info("provider.kubernetes: resource updated")
-		updated = append(updated, resource)
+		}).Error("provider.kubernetes: got error while sending notification")
 	}
 
-	return
+	log.WithFields(log.Fields{
+		"name":           resource.Name,
+		"kind":           resource.Kind(),
+		"previous":       plan.CurrentVersion,
+		"new":            plan.NewVersion,
+		"previousDigest": plan.CurrentDigest,
+		"newDigest":      plan.NewDigest,
+		"namespace":      resource.Namespace,
+	}).Info("provider.kubernetes: resource updated")
+	return resource
 }
 
 func getDesiredImage(delta map[string]string, currentImage string) (string, error) {
@@ -425,15 +682,29 @@ func getDesiredImage(delta map[string]string, currentImage string) (string, erro
 
 // createUpdatePlans - impacted deployments by changed repository
 func (p *Provider) createUpdatePlans(repo *types.Repository) ([]*UpdatePlan, error) {
+	return p.createUpdatePlansForTrigger(repo, "")
+}
+
+func (p *Provider) createUpdatePlansForEvent(event *types.Event) ([]*UpdatePlan, error) {
+	return p.createUpdatePlansForTrigger(&event.Repository, event.TriggerName)
+}
+
+func (p *Provider) createUpdatePlansForTrigger(repo *types.Repository, triggerName string) ([]*UpdatePlan, error) {
 	impacted := []*UpdatePlan{}
 
 	for _, resource := range p.cache.Values() {
 
 		labels := resource.GetLabels()
 		annotations := resource.GetAnnotations()
+		// Poll events are broadcast by repository, so apply them only to the
+		// resources that explicitly opted into polling.
+		if triggerName == types.TriggerTypePoll.String() &&
+			policies.GetTriggerPolicy(labels, annotations) != types.TriggerTypePoll {
+			continue
+		}
 
 		plc := policy.GetPolicyFromLabelsOrAnnotations(labels, annotations)
-		if plc.Type() == policy.PolicyTypeNone {
+		if plc.Type() == types.PolicyTypeNone {
 			continue
 		}
 
@@ -449,11 +720,64 @@ func (p *Provider) createUpdatePlans(repo *types.Repository) ([]*UpdatePlan, err
 		}
 
 		if shouldUpdateDeployment {
+			updated.CurrentDigest = p.currentDigest(resource, repo, updated)
+			if repo.PlatformVerified {
+				platforms, resolutionErr := p.platforms.Resolve(resource)
+				if resolutionErr != types.PlatformErrorNone || !types.PlatformsSupportAll(repo.Platforms, platforms) {
+					log.WithFields(log.Fields{
+						"candidate_platforms": repo.Platforms,
+						"eligible_platforms":  platforms,
+						"reason":              resolutionErr,
+						"deployment":          resource.Name,
+						"kind":                resource.Kind(),
+						"namespace":           resource.Namespace,
+					}).Warn("provider.kubernetes: skipping polling event that is not compatible with current workload platforms")
+					continue
+				}
+			}
 			impacted = append(impacted, updated)
 		}
 	}
 
 	return impacted, nil
+}
+
+// currentDigest determines the image digest the resource is currently
+// running for the image being replaced. It prefers the digest reported by
+// the running pods (per image reference, accurate for multi-container
+// resources) and falls back to the keel.sh/digest annotation, which records
+// the digest keel deployed last time. Empty string when neither is known.
+func (p *Provider) currentDigest(resource *k8s.GenericResource, repo *types.Repository, plan *UpdatePlan) string {
+	if digest := p.runningDigest(resource, repo, plan); digest != "" {
+		return digest
+	}
+	return resource.GetAnnotations()[types.KeelDigestAnnotation]
+}
+
+// runningDigest resolves the digest a workload is actually running for the
+// image being replaced (same repository, current tag).
+func (p *Provider) runningDigest(resource *k8s.GenericResource, repo *types.Repository, plan *UpdatePlan) string {
+	if p.runningDigests == nil || plan.CurrentVersion == "" {
+		return ""
+	}
+	running := p.runningDigests.Resolve(resource)
+	if len(running) == 0 {
+		return ""
+	}
+	repoRef, err := image.Parse(repo.String())
+	if err != nil {
+		return ""
+	}
+	for img, digests := range running {
+		ref, err := image.Parse(img)
+		if err != nil {
+			continue
+		}
+		if ref.Repository() == repoRef.Repository() && ref.Tag() == plan.CurrentVersion && len(digests) > 0 {
+			return digests[0]
+		}
+	}
+	return ""
 }
 
 func (p *Provider) namespaces() (*v1.NamespaceList, error) {

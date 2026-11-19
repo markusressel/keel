@@ -2,7 +2,6 @@ package types
 
 import (
 	"fmt"
-
 	"github.com/keel-hq/keel/util/image"
 )
 
@@ -20,16 +19,74 @@ type TrackedImage struct {
 	Namespace    string            `json:"namespace"`
 	Secrets      []string          `json:"secrets"`
 	Meta         map[string]string `json:"meta"` // metadata supplied by providers
+	Platforms    []Platform        `json:"-"`
+	PlatformErr  PlatformError     `json:"-"`
+	// RunningDigests are the image digests reported by the workload runtime for
+	// this image reference. Empty when the provider cannot observe them.
+	RunningDigests []string `json:"-"`
 	// a list of pre-release tags, ie: 1.0.0-dev, 1.5.0-prod get translated into
 	// dev, prod
 	// combined semver tags
 	Tags   []string `json:"tags"`
 	Policy Policy   `json:"policy"`
+	// PollTagsAfterCurrent makes polling list only the tags pushed after
+	// the running tag instead of every tag of the repository.
+	PollTagsAfterCurrent bool `json:"pollTagsAfterCurrent"`
+}
+
+// Platform identifies the operating system and CPU architecture required by a
+// workload and advertised by an image manifest.
+type Platform struct {
+	OS           string `json:"os"`
+	Architecture string `json:"architecture"`
+	Variant      string `json:"variant,omitempty"`
+}
+
+// PlatformError identifies why a workload platform set could not be resolved.
+type PlatformError string
+
+const (
+	PlatformErrorNone                PlatformError = ""
+	PlatformErrorNodeMetadata        PlatformError = "node_metadata_unavailable"
+	PlatformErrorNoEligibleNodes     PlatformError = "no_eligible_nodes"
+	PlatformErrorWorkloadMetadata    PlatformError = "workload_platform_missing"
+	PlatformErrorHelmWorkloadMapping PlatformError = "helm_workload_unmapped"
+)
+
+// Supports reports whether an image platform can run on the target platform.
+func (p Platform) Supports(target Platform) bool {
+	if p.OS != target.OS || p.Architecture != target.Architecture {
+		return false
+	}
+	return target.Variant == "" || p.Variant == target.Variant
+}
+
+// PlatformsSupportAll reports whether candidate manifests cover every target platform.
+func PlatformsSupportAll(candidates, targets []Platform) bool {
+	if len(candidates) == 0 || len(targets) == 0 {
+		return false
+	}
+	for _, target := range targets {
+		supported := false
+		for _, candidate := range candidates {
+			if candidate.Supports(target) {
+				supported = true
+				break
+			}
+		}
+		if !supported {
+			return false
+		}
+	}
+	return true
 }
 
 type Policy interface {
 	ShouldUpdate(current, new string) (bool, error)
 	Name() string
+	Filter(tags []string) []string
+	Type() PolicyType
+	KeepTag() bool
 }
 
 func (i TrackedImage) String() string {

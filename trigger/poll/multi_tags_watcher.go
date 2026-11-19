@@ -1,10 +1,6 @@
 package poll
 
 import (
-	"sort"
-	"strings"
-
-	"github.com/Masterminds/semver"
 	"github.com/keel-hq/keel/extension/credentialshelper"
 	"github.com/keel-hq/keel/provider"
 	"github.com/keel-hq/keel/registry"
@@ -56,7 +52,7 @@ func (j *WatchRepositoryTagsJob) Run() {
 		registryOpts.Password = creds.Password
 	}
 
-	repository, err := j.registryClient.Get(registryOpts)
+	repository, err := j.getRepository(registryOpts)
 
 	if err != nil {
 		log.WithFields(log.Fields{
@@ -86,6 +82,56 @@ func (j *WatchRepositoryTagsJob) Run() {
 	}
 }
 
+// getRepository lists the repository's tags. When every workload sharing this
+// watcher opted in to keel.sh/pollTagsAfterCurrent, it lists only the tags
+// pushed after each workload's current tag; otherwise it lists every tag.
+func (j *WatchRepositoryTagsJob) getRepository(opts registry.Opts) (*registry.Repository, error) {
+	afterTags := j.pollTagsAfter()
+	if len(afterTags) == 0 {
+		return j.registryClient.Get(opts)
+	}
+
+	repository := &registry.Repository{Name: opts.Name}
+	seen := make(map[string]bool)
+	for _, after := range afterTags {
+		opts.After = after
+		repo, err := j.registryClient.Get(opts)
+		if err != nil {
+			return nil, err
+		}
+		for _, tag := range repo.Tags {
+			if !seen[tag] {
+				seen[tag] = true
+				repository.Tags = append(repository.Tags, tag)
+			}
+		}
+	}
+	return repository, nil
+}
+
+// pollTagsAfter returns the distinct current tags of the related workloads,
+// or nil unless every one of them opted in to keel.sh/pollTagsAfterCurrent.
+func (j *WatchRepositoryTagsJob) pollTagsAfter() []string {
+	trackedImages, err := j.providers.TrackedImages()
+	if err != nil {
+		return nil
+	}
+
+	var afterTags []string
+	seen := make(map[string]bool)
+	for _, trackedImage := range getRelatedTrackedImages(j.details.trackedImage, trackedImages) {
+		if !trackedImage.PollTagsAfterCurrent {
+			return nil
+		}
+		tag := trackedImage.Image.Tag()
+		if !seen[tag] {
+			seen[tag] = true
+			afterTags = append(afterTags, tag)
+		}
+	}
+	return afterTags
+}
+
 func (j *WatchRepositoryTagsJob) computeEvents(tags []string) ([]types.Event, error) {
 	trackedImages, err := j.providers.TrackedImages()
 	if err != nil {
@@ -94,49 +140,148 @@ func (j *WatchRepositoryTagsJob) computeEvents(tags []string) ([]types.Event, er
 
 	events := []types.Event{}
 
-	// Keep only semver tags, sorted desc (to optimize process)
-	versions := semverSort(tags)
+	// This contains all tracked images that share the same imageIdentifier and thus, the same watcher
+	allRelatedTrackedImages := getRelatedTrackedImages(j.details.trackedImage, trackedImages)
+	platformCache := make(map[string][]types.Platform)
+	platformErrorCache := make(map[string]error)
+	diagnosedCandidates := make(map[string]bool)
 
-	for _, trackedImage := range getRelatedTrackedImages(j.details.trackedImage, trackedImages) {
-		// Current version tag might not be a valid semver one
-		currentVersion, invalidCurrentVersion := semver.NewVersion(trackedImage.Image.Tag())
-		// matches, going through tags
-		for _, version := range versions {
-			if invalidCurrentVersion == nil && (currentVersion.GreaterThan(version) || currentVersion.Equal(version)) {
-				// Current tag is a valid semver, and is bigger than currently tested one
-				// -> we can stop now, nothing will be worth upgrading in the rest of the sorted list
-				break
+	for _, trackedImage := range allRelatedTrackedImages {
+		if trackedImage.PlatformErr != types.PlatformErrorNone || len(trackedImage.Platforms) == 0 {
+			reason := trackedImage.PlatformErr
+			if reason == types.PlatformErrorNone {
+				reason = types.PlatformErrorWorkloadMetadata
 			}
-			update, err := trackedImage.Policy.ShouldUpdate(trackedImage.Image.Tag(), version.Original())
-			// log.WithFields(log.Fields{
-			// 	"current_tag": j.details.trackedImage.Image.Tag(),
-			// 	"image_name":  j.details.trackedImage.Image.Remote(),
-			// }).Debug("trigger.poll.WatchRepositoryTagsJob: tag: ", version.Original(), "; update: ", update, "; err:", err)
+			fields := log.Fields{
+				"image":  trackedImage.Image.Repository(),
+				"reason": reason,
+			}
+			if reason == types.PlatformErrorNodeMetadata {
+				fields["remediation"] = "verify Keel's service account can list core/v1 nodes and that each node reports status.nodeInfo.operatingSystem and architecture"
+			}
+			log.WithFields(fields).Warn("trigger.poll.WatchRepositoryTagsJob: skipping workload because its eligible platforms could not be established")
+			continue
+		}
+
+		filteredTags := tags
+
+		// The fact that they are related, does not mean they share the exact same Policy configuration, so wee need
+		// to calculate the tags here for each image.
+		filteredTags = trackedImage.Policy.Filter(tags)
+
+		for _, tag := range filteredTags {
+
+			update, err := trackedImage.Policy.ShouldUpdate(trackedImage.Image.Tag(), tag)
 			if err != nil {
 				continue
 			}
-			if update && !exists(version.Original(), events) {
+			if update == false {
+				continue
+			}
+			// When using tags watcher we rely completely on tag names to deal with updates.
+			if trackedImage.Image.Tag() == tag {
+				break
+			}
+
+			platforms, resolved := platformCache[tag]
+			platformErr, failed := platformErrorCache[tag]
+			if !resolved && !failed {
+				platforms, platformErr = j.candidatePlatforms(trackedImage, tag)
+				if platformErr != nil {
+					platformErrorCache[tag] = platformErr
+				} else {
+					platformCache[tag] = platforms
+				}
+			}
+			if platformErr != nil {
+				if !diagnosedCandidates[tag] {
+					log.WithFields(log.Fields{
+						"error": platformErr,
+						"image": trackedImage.Image.Repository(),
+						"tag":   tag,
+					}).Warn("trigger.poll.WatchRepositoryTagsJob: skipping candidate because its platform could not be established")
+					diagnosedCandidates[tag] = true
+				}
+				continue
+			}
+			if !supportsRelatedWorkloads(platforms, tag, allRelatedTrackedImages) {
+				if !diagnosedCandidates[tag] {
+					log.WithFields(log.Fields{
+						"candidate_platforms": platforms,
+						"eligible_platforms":  relatedPlatforms(allRelatedTrackedImages),
+						"image":               trackedImage.Image.Repository(),
+						"tag":                 tag,
+					}).Warn("trigger.poll.WatchRepositoryTagsJob: skipping candidate because it is incompatible with a related workload platform")
+					diagnosedCandidates[tag] = true
+				}
+				continue
+			}
+			if !exists(tag, events) {
 				event := types.Event{
 					Repository: types.Repository{
-						Name: j.details.trackedImage.Image.Repository(),
-						Tag:  version.Original(),
+						Name:             trackedImage.Image.Repository(),
+						Tag:              tag,
+						Platforms:        platforms,
+						PlatformVerified: true,
 					},
 					TriggerName: types.TriggerTypePoll.String(),
 				}
 				events = append(events, event)
-				// Only keep first match per image (should be the highest usable version)
 				break
 			}
-
 		}
-
 	}
+
 	log.WithFields(log.Fields{
 		"current_tag": j.details.trackedImage.Image.Tag(),
 		"image_name":  j.details.trackedImage.Image.Remote(),
 	}).Debug("trigger.poll.WatchRepositoryTagsJob: events: ", events)
 
 	return events, nil
+}
+
+func relatedPlatforms(trackedImages []*types.TrackedImage) []types.Platform {
+	var result []types.Platform
+	seen := make(map[types.Platform]struct{})
+	for _, trackedImage := range trackedImages {
+		for _, platform := range trackedImage.Platforms {
+			if _, ok := seen[platform]; ok {
+				continue
+			}
+			seen[platform] = struct{}{}
+			result = append(result, platform)
+		}
+	}
+	return result
+}
+
+func (j *WatchRepositoryTagsJob) candidatePlatforms(trackedImage *types.TrackedImage, tag string) ([]types.Platform, error) {
+	opts := registry.Opts{
+		Registry: trackedImage.Image.Scheme() + "://" + trackedImage.Image.Registry(),
+		Name:     trackedImage.Image.ShortName(),
+		Tag:      tag,
+	}
+	if creds, err := credentialshelper.GetCredentials(trackedImage); err == nil {
+		opts.Username = creds.Username
+		opts.Password = creds.Password
+	}
+	return j.registryClient.Platforms(opts)
+}
+
+func supportsRelatedWorkloads(candidatePlatforms []types.Platform, candidateTag string, trackedImages []*types.TrackedImage) bool {
+	for _, trackedImage := range trackedImages {
+		update, err := trackedImage.Policy.ShouldUpdate(trackedImage.Image.Tag(), candidateTag)
+		if err != nil || !update || trackedImage.Image.Tag() == candidateTag {
+			continue
+		}
+		if trackedImage.PlatformErr != types.PlatformErrorNone || len(trackedImage.Platforms) == 0 {
+			return false
+		}
+		if !types.PlatformsSupportAll(candidatePlatforms, trackedImage.Platforms) {
+			return false
+		}
+	}
+	return true
 }
 
 func exists(tag string, events []types.Event) bool {
@@ -148,34 +293,16 @@ func exists(tag string, events []types.Event) bool {
 	return false
 }
 
-// Filter and sort tags according to semver, desc
-func semverSort(tags []string) []*semver.Version {
-	var versions []*semver.Version
-	for _, t := range tags {
-		if len(strings.SplitN(t, ".", 3)) < 2 {
-			// Keep only X.Y.Z+ semver
-			continue
-		}
-		v, err := semver.NewVersion(t)
-		// Filter out non semver tags
-		if err != nil {
-			continue
-		}
-		versions = append(versions, v)
-	}
-	// Sort desc, following semver
-	sort.Slice(versions, func(i, j int) bool { return versions[j].LessThan(versions[i]) })
-	return versions
-}
-
 func getRelatedTrackedImages(ours *types.TrackedImage, all []*types.TrackedImage) []*types.TrackedImage {
-	b := all[:0]
+	b := make([]*types.TrackedImage, 0, len(all))
 	for _, x := range all {
-		if x.Image.Repository() == ours.Image.Repository() {
+		// A repository watcher may be shared, but webhook consumers must not
+		// influence the tag selected by its polling job.
+		if x.Trigger == types.TriggerTypePoll &&
+			getImageIdentifier(x.Image, x.Policy.KeepTag()) == getImageIdentifier(ours.Image, ours.Policy.KeepTag()) {
 			b = append(b, x)
 		}
 	}
-
 	return b
 }
 

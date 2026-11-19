@@ -6,10 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"os"
 	"time"
 
-	"github.com/keel-hq/keel/constants"
 	"github.com/keel-hq/keel/extension/notification"
 	"github.com/keel-hq/keel/types"
 
@@ -36,31 +34,38 @@ func (s *sender) Configure(config *notification.Config) (bool, error) {
 	// Get configuration
 	var httpConfig Config
 
-	if os.Getenv(constants.WebhookEndpointEnv) != "" {
-		httpConfig.Endpoint = os.Getenv(constants.WebhookEndpointEnv)
-	} else {
-		return false, nil
-	}
+	httpConfig.Endpoint = config.Notifications.Webhook.Endpoint
 
 	// Validate endpoint URL.
 	if httpConfig.Endpoint == "" {
 		return false, nil
 	}
 	if _, err := url.ParseRequestURI(httpConfig.Endpoint); err != nil {
-		return false, fmt.Errorf("could not parse endpoint URL: %s\n", err)
+		// The parse error is not returned: url.ParseRequestURI echoes the
+		// input in its message and the endpoint may carry a secret.
+		return false, fmt.Errorf("could not parse endpoint URL: not a valid absolute URL")
 	}
 	s.endpoint = httpConfig.Endpoint
 
 	// Setup HTTP client.
 	s.client = &http.Client{
-		Transport: http.DefaultTransport,
-		Timeout:   timeout,
+		Transport:     http.DefaultTransport,
+		Timeout:       timeout,
+		CheckRedirect: rejectRedirect,
 	}
 
+	// The endpoint URL may embed the webhook signing secret in its path or
+	// query string, so only a redacted form is ever logged.
 	log.WithFields(log.Fields{
 		"name":     "webhook",
-		"endpoint": s.endpoint,
+		"endpoint": notification.SafeURL(s.endpoint),
 	}).Info("extension.notification.webhook: sender configured")
+	if log.IsLevelEnabled(log.DebugLevel) {
+		log.WithFields(log.Fields{
+			"name":     "webhook",
+			"endpoint": notification.DebugURL(s.endpoint),
+		}).Debug("extension.notification.webhook: sender endpoint (secrets redacted)")
+	}
 
 	return true, nil
 }
@@ -78,13 +83,21 @@ func (s *sender) Send(event types.EventNotification) error {
 
 	// Send notification via HTTP POST.
 	resp, err := s.client.Post(s.endpoint, "application/json", bytes.NewBuffer(jsonNotification))
-	if err != nil || resp == nil || (resp.StatusCode != 200 && resp.StatusCode != 201) {
-		if resp != nil {
-			return fmt.Errorf("got status %d, expected 200/201", resp.StatusCode)
-		}
-		return err
+	if err != nil {
+		return fmt.Errorf("could not send webhook: %w", err)
+	}
+	if resp == nil {
+		return fmt.Errorf("could not send webhook: empty HTTP response")
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("got HTTP status %s, expected 2xx", resp.Status)
+	}
+
 	return nil
+}
+
+func rejectRedirect(_ *http.Request, _ []*http.Request) error {
+	return http.ErrUseLastResponse
 }
