@@ -1,0 +1,213 @@
+# Optional hardening: limit what the Keel ServiceAccount may change.
+#
+# The ClusterRole lets Keel update Deployments, StatefulSets, DaemonSets and CronJobs in every namespace, and
+# RBAC cannot narrow that down to single fields. Whoever gets Keel's token could therefore make any of these
+# workloads privileged, mount host paths or change their commands. This ValidatingAdmissionPolicy only admits
+# updates by the Keel ServiceAccount that change what Keel itself changes (provider/kubernetes):
+#
+# - the image of containers, init containers and image volumes, within the same repository (tag or digest);
+# - the annotation keel.sh/update-time on the pod template (spec.jobTemplate for CronJobs), which starts the
+#   rollout;
+# - the workload annotations kubernetes.io/change-cause, keel.sh/digest and keel.sh/digests (and
+#   deprecated.daemonset.template.generation, which the API server raises on DaemonSets).
+#
+# Everything else must equal the stored object, and only workloads that carry a keel.sh/policy label or
+# annotation may change. Requests by other users are not affected (matchConditions), and Keel can still
+# delete pods, which force updates of the same tag need.
+#
+# Apply it after the other manifests: kubectl apply -f docs/manifests/keel/optional/admission-policy.yaml
+# (kubectl apply -f docs/manifests/keel/ does not enter this directory).
+#
+# Requirements and limits:
+#
+# - Kubernetes 1.30 or newer (admissionregistration.k8s.io/v1).
+# - Keel runs as the ServiceAccount keel in the namespace keel. Change the username in matchConditions if
+#   not.
+# - Not compatible with the Helm provider (HELM3_PROVIDER="true"): Helm upgrades run with Keel's
+#   credentials and change much more than images. Leave this policy out when you use it.
+#
+# The repository of an image is the part that find('^([^/@]*/)*[^/:@]*') returns: the name without tag and
+# digest, also with a registry port (host:5000/name:tag). Keel writes Docker Hub images in a normalized form
+# (busybox:1.36 becomes library/busybox:1.38), so docker.io/, index.docker.io/ and library/ are stripped
+# before the comparison. Keel never reorders containers or volumes, so their names must keep their order.
+#
+# All objects are compared through dyn(): typed objects cannot be iterated in CEL, but at runtime they are
+# maps, so fields that future Kubernetes versions add to a pod spec or container are covered as well.
+#
+# A denied update shows up in the Keel log as
+#   provider.kubernetes: got error while updating resource ... denied request: <message>
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: keel-image-updates-only
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["deployments", "statefulsets", "daemonsets"]
+      - apiGroups: ["batch"]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["cronjobs"]
+  matchConditions:
+    - name: keel-service-account
+      expression: "request.userInfo.username == 'system:serviceaccount:keel:keel'"
+  variables:
+    - name: new
+      expression: "dyn(object)"
+    - name: old
+      expression: "dyn(oldObject)"
+    - name: isCronJob
+      expression: "request.kind.kind == 'CronJob'"
+    - name: templateKey
+      expression: "variables.isCronJob ? 'jobTemplate' : 'template'"
+    - name: keelManaged
+      expression: >-
+        'keel.sh/policy' in variables.old.metadata.?labels.orValue({}) ||
+        'keel.sh/policy' in variables.old.metadata.?annotations.orValue({})
+    # where Keel sets keel.sh/update-time: the pod template, or the job template of a CronJob
+    - name: newRolloutMeta
+      expression: "variables.new.spec[variables.templateKey].?metadata.orValue({})"
+    - name: oldRolloutMeta
+      expression: "variables.old.spec[variables.templateKey].?metadata.orValue({})"
+    - name: newRolloutAnnotations
+      expression: "variables.newRolloutMeta.?annotations.orValue({})"
+    - name: oldRolloutAnnotations
+      expression: "variables.oldRolloutMeta.?annotations.orValue({})"
+    - name: newTemplate
+      expression: "variables.isCronJob ? variables.new.spec.jobTemplate.spec.template : variables.new.spec.template"
+    - name: oldTemplate
+      expression: "variables.isCronJob ? variables.old.spec.jobTemplate.spec.template : variables.old.spec.template"
+    - name: newPod
+      expression: "variables.newTemplate.spec"
+    - name: oldPod
+      expression: "variables.oldTemplate.spec"
+    - name: newContainers
+      expression: "variables.newPod.containers"
+    - name: oldContainers
+      expression: "variables.oldPod.containers"
+    - name: newInitContainers
+      expression: "variables.newPod.?initContainers.orValue([])"
+    - name: oldInitContainers
+      expression: "variables.oldPod.?initContainers.orValue([])"
+    - name: newVolumes
+      expression: "variables.newPod.?volumes.orValue([])"
+    - name: oldVolumes
+      expression: "variables.oldPod.?volumes.orValue([])"
+    - name: newContainerRepos
+      expression: >-
+        variables.newContainers.map(x, string(x.image).find('^([^/@]*/)*[^/:@]*'))
+        .map(r, r.startsWith('index.docker.io/') ? r.substring(16) : (r.startsWith('docker.io/') ? r.substring(10) : r))
+        .map(r, r.startsWith('library/') ? r.substring(8) : r)
+    - name: oldContainerRepos
+      expression: >-
+        variables.oldContainers.map(x, string(x.image).find('^([^/@]*/)*[^/:@]*'))
+        .map(r, r.startsWith('index.docker.io/') ? r.substring(16) : (r.startsWith('docker.io/') ? r.substring(10) : r))
+        .map(r, r.startsWith('library/') ? r.substring(8) : r)
+    - name: newInitContainerRepos
+      expression: >-
+        variables.newInitContainers.map(x, string(x.image).find('^([^/@]*/)*[^/:@]*'))
+        .map(r, r.startsWith('index.docker.io/') ? r.substring(16) : (r.startsWith('docker.io/') ? r.substring(10) : r))
+        .map(r, r.startsWith('library/') ? r.substring(8) : r)
+    - name: oldInitContainerRepos
+      expression: >-
+        variables.oldInitContainers.map(x, string(x.image).find('^([^/@]*/)*[^/:@]*'))
+        .map(r, r.startsWith('index.docker.io/') ? r.substring(16) : (r.startsWith('docker.io/') ? r.substring(10) : r))
+        .map(r, r.startsWith('library/') ? r.substring(8) : r)
+    - name: newVolumeRepos
+      expression: >-
+        variables.newVolumes.map(x, ('image' in x ? string(x.image.?reference.orValue('')) : '').find('^([^/@]*/)*[^/:@]*'))
+        .map(r, r.startsWith('index.docker.io/') ? r.substring(16) : (r.startsWith('docker.io/') ? r.substring(10) : r))
+        .map(r, r.startsWith('library/') ? r.substring(8) : r)
+    - name: oldVolumeRepos
+      expression: >-
+        variables.oldVolumes.map(x, ('image' in x ? string(x.image.?reference.orValue('')) : '').find('^([^/@]*/)*[^/:@]*'))
+        .map(r, r.startsWith('index.docker.io/') ? r.substring(16) : (r.startsWith('docker.io/') ? r.substring(10) : r))
+        .map(r, r.startsWith('library/') ? r.substring(8) : r)
+    - name: newAnnotations
+      expression: "variables.new.metadata.?annotations.orValue({})"
+    - name: oldAnnotations
+      expression: "variables.old.metadata.?annotations.orValue({})"
+    # Keel's annotations, plus the one the API server raises itself when a DaemonSet template changes
+    - name: keelAnnotations
+      expression: "['kubernetes.io/change-cause', 'keel.sh/digest', 'keel.sh/digests', 'deprecated.daemonset.template.generation']"
+  validations:
+    - expression: "variables.keelManaged"
+      message: "Keel may only update workloads with a keel.sh/policy label or annotation"
+
+    - expression: >-
+        variables.new.spec.all(k, k == variables.templateKey || (k in variables.old.spec && variables.new.spec[k] == variables.old.spec[k])) &&
+        variables.old.spec.all(k, k == variables.templateKey || k in variables.new.spec)
+      message: "Keel may not change the workload spec outside the pod template"
+
+    - expression: >-
+        variables.newRolloutMeta.all(k, k == 'annotations' || (k in variables.oldRolloutMeta && variables.newRolloutMeta[k] == variables.oldRolloutMeta[k])) &&
+        variables.oldRolloutMeta.all(k, k == 'annotations' || k in variables.newRolloutMeta) &&
+        variables.newRolloutAnnotations.all(k, k == 'keel.sh/update-time' || (k in variables.oldRolloutAnnotations && variables.newRolloutAnnotations[k] == variables.oldRolloutAnnotations[k])) &&
+        variables.oldRolloutAnnotations.all(k, k == 'keel.sh/update-time' || k in variables.newRolloutAnnotations)
+      message: "Keel may only set the template annotation keel.sh/update-time"
+
+    - expression: >-
+        !variables.isCronJob || (
+          variables.new.spec.jobTemplate.spec.all(k, k == 'template' || (k in variables.old.spec.jobTemplate.spec && variables.new.spec.jobTemplate.spec[k] == variables.old.spec.jobTemplate.spec[k])) &&
+          variables.old.spec.jobTemplate.spec.all(k, k == 'template' || k in variables.new.spec.jobTemplate.spec) &&
+          variables.newTemplate.?metadata.orValue({}) == variables.oldTemplate.?metadata.orValue({}))
+      message: "Keel may not change the job spec of a CronJob outside the pod spec"
+
+    - expression: >-
+        variables.newPod.all(k, k in ['containers', 'initContainers', 'volumes'] || (k in variables.oldPod && variables.newPod[k] == variables.oldPod[k])) &&
+        variables.oldPod.all(k, k in ['containers', 'initContainers', 'volumes'] || k in variables.newPod)
+      message: "Keel may not change the pod spec outside containers and volumes"
+
+    - expression: >-
+        variables.newContainers.map(x, x.name) == variables.oldContainers.map(x, x.name) &&
+        variables.newContainerRepos == variables.oldContainerRepos &&
+        variables.newContainers.all(c, variables.oldContainers.exists(o, o.name == c.name &&
+          c.all(k, k == 'image' || (k in o && c[k] == o[k])) &&
+          o.all(k, k == 'image' || k in c)))
+      messageExpression: >-
+        'Keel may only change the image tag or digest of a container (new: ' +
+        variables.newContainers.map(c, string(c.name) + '=' + string(c.image)).join(', ') + '; old: ' +
+        variables.oldContainers.map(c, string(c.name) + '=' + string(c.image)).join(', ') + ')'
+
+    - expression: >-
+        variables.newInitContainers.map(x, x.name) == variables.oldInitContainers.map(x, x.name) &&
+        variables.newInitContainerRepos == variables.oldInitContainerRepos &&
+        variables.newInitContainers.all(c, variables.oldInitContainers.exists(o, o.name == c.name &&
+          c.all(k, k == 'image' || (k in o && c[k] == o[k])) &&
+          o.all(k, k == 'image' || k in c)))
+      messageExpression: >-
+        'Keel may only change the image tag or digest of an init container (new: ' +
+        variables.newInitContainers.map(c, string(c.name) + '=' + string(c.image)).join(', ') + '; old: ' +
+        variables.oldInitContainers.map(c, string(c.name) + '=' + string(c.image)).join(', ') + ')'
+
+    - expression: >-
+        variables.newVolumes.map(x, x.name) == variables.oldVolumes.map(x, x.name) &&
+        variables.newVolumeRepos == variables.oldVolumeRepos &&
+        variables.newVolumes.all(v, variables.oldVolumes.exists(o, o.name == v.name &&
+          v.all(k, k == 'image' || (k in o && v[k] == o[k])) &&
+          o.all(k, k == 'image' || k in v) &&
+          ('image' in v) == ('image' in o) &&
+          (!('image' in v) || (
+            v.image.all(k, k == 'reference' || (k in o.image && v.image[k] == o.image[k])) &&
+            o.image.all(k, k == 'reference' || k in v.image)))))
+      message: "Keel may only change the reference of an image volume, within the same repository"
+
+    - expression: >-
+        variables.new.metadata.?labels.orValue({}) == variables.old.metadata.?labels.orValue({}) &&
+        variables.new.metadata.?ownerReferences.orValue([]) == variables.old.metadata.?ownerReferences.orValue([]) &&
+        variables.new.metadata.?finalizers.orValue([]) == variables.old.metadata.?finalizers.orValue([]) &&
+        variables.newAnnotations.all(k, k in variables.keelAnnotations || (k in variables.oldAnnotations && variables.newAnnotations[k] == variables.oldAnnotations[k])) &&
+        variables.oldAnnotations.all(k, k in variables.keelAnnotations || k in variables.newAnnotations)
+      message: "Keel may only change the annotations kubernetes.io/change-cause, keel.sh/digest and keel.sh/digests"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: keel-image-updates-only
+spec:
+  policyName: keel-image-updates-only
+  validationActions: [Deny]
