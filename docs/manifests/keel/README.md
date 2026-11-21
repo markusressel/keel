@@ -24,6 +24,7 @@ Applied in filename order; the numeric prefixes keep dependencies first
 | `20-secret.yaml` | Basic Auth password (placeholder — edit before applying) |
 | `30-deployment.yaml` | Keel Deployment, probes on `/healthz:9300` |
 | `40-service.yaml` | ClusterIP Service for the Keel API/UI and registry webhooks |
+| `optional/admission-policy.yaml` | Optional: limits Keel's updates to image tags ([below](#limiting-what-keel-may-change)) |
 
 ## Install
 
@@ -74,13 +75,63 @@ To remove it: `kubectl delete -f docs/manifests/keel/`.
 - **RBAC** — `11-clusterrole.yaml` follows the chart's default ClusterRole, with
   two deliberate differences: `pods/portforward` is omitted (this Keel version
   never calls it), and the `secrets`/`configmaps` rules are marked as
-  Helm-provider-only in comments, since Keel reads those only through Helm's
-  release-storage driver. Set `HELM3_PROVIDER="false"` and drop those two rules if
-  the cluster has no Helm releases. Keel is cluster-scoped by design — it watches
+  Helm-provider-only in comments, since Keel reads those mostly through Helm's
+  release-storage driver. Set `HELM3_PROVIDER="false"` and drop the `configmaps`
+  rule if the cluster has no Helm releases. Keel itself reads only the
+  `imagePullSecrets` that workloads reference, by name; without private
+  registries the `secrets` rule can go as well, otherwise `get` is enough. Keel is cluster-scoped by design — it watches
   workloads across namespaces — hence a ClusterRole rather than a namespaced Role.
 - **Service** — `40-service.yaml` is a ClusterIP, so Keel is reachable only
   inside the cluster. Registry webhooks need an externally reachable address;
   change the Service type or put an Ingress in front of it.
+
+## Limiting what Keel may change
+
+Keel's ClusterRole allows updates of every Deployment, StatefulSet, DaemonSet and
+CronJob in the cluster, and RBAC cannot narrow that down to single fields. Whoever
+obtains Keel's ServiceAccount token could make any of these workloads privileged,
+mount host paths or replace their commands.
+
+`optional/admission-policy.yaml` is a ValidatingAdmissionPolicy (Kubernetes 1.30+)
+that closes this gap. It applies only to requests by Keel's ServiceAccount and
+admits only the changes Keel itself makes:
+
+- the image of containers, init containers and image volumes, within the same
+  repository (a new tag or digest);
+- the annotation `keel.sh/update-time` on the pod template (on `spec.jobTemplate`
+  for CronJobs), which starts the rollout;
+- the workload annotations `kubernetes.io/change-cause`, `keel.sh/digest` and
+  `keel.sh/digests`;
+
+and only on workloads that carry a `keel.sh/policy` label or annotation.
+Everything else in the request must equal the stored object. Pod specs and
+containers are compared field by field through `dyn()`, so fields that newer
+Kubernetes versions add are covered too. Docker Hub names are compared in their
+normalized form, because Keel writes `busybox:1.36` back as
+`library/busybox:1.38`.
+
+Apply it after the other manifests:
+
+```bash
+kubectl apply -f docs/manifests/keel/optional/admission-policy.yaml
+```
+
+Notes:
+
+- The policy expects the ServiceAccount `keel` in the namespace `keel`. Change
+  the username in its `matchConditions` if Keel runs elsewhere.
+- It does not work with the Helm provider (`HELM3_PROVIDER="true"`): Helm
+  upgrades run with Keel's credentials and change much more than images. Use the
+  policy only with `HELM3_PROVIDER="false"`.
+- Keel can still delete pods (needed for force updates of the same tag), and a
+  stolen token can still move a Keel-managed workload to another tag of the same
+  repository, including an older one.
+- A denied update appears in the Keel log as `provider.kubernetes: got error
+  while updating resource ... denied request: <message>`; the message names the
+  check that failed, and for containers lists the old and new images.
+- The e2e suite (`make e2e`) applies this file to its Keel, so every scenario runs
+  through it, and `TestAdmissionPolicyLimitsKeelServiceAccount` checks that
+  other changes made with Keel's credentials are denied.
 
 ## Prerequisites
 

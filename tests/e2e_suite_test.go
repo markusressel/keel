@@ -104,6 +104,7 @@ func (s *E2ESuite) TearDownSuite() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	deleteAdmissionPolicy(ctx, s.client, s.cfg)
 	_ = s.client.RbacV1().ClusterRoleBindings().Delete(ctx, "keel-e2e-"+s.cfg.runID, metav1.DeleteOptions{})
 	_ = s.client.RbacV1().ClusterRoles().Delete(ctx, "keel-e2e-"+s.cfg.runID, metav1.DeleteOptions{})
 	_ = s.client.CoreV1().Namespaces().Delete(ctx, s.cfg.systemNamespace(), metav1.DeleteOptions{})

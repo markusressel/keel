@@ -89,6 +89,10 @@ func createKeelResources(ctx context.Context, client kubernetes.Interface, cfg e
 			return err
 		},
 		func() error {
+			// before Keel starts, so that every scenario runs through the policy
+			return createAdmissionPolicy(ctx, client, cfg)
+		},
+		func() error {
 			_, err := client.AppsV1().Deployments(namespace).Create(ctx, keelDeployment(cfg), metav1.CreateOptions{})
 			return err
 		},

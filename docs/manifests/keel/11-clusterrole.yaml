@@ -15,8 +15,9 @@ rules:
       - list
   # Needed only with the Helm provider (HELM3_PROVIDER="true"): the Helm SDK keeps
   # release state in Secrets (the default driver) and reads it with these verbs.
-  # Keel itself never reads secrets — set HELM3_PROVIDER="false" and drop this rule
-  # if the cluster has no Helm releases.
+  # Keel itself reads only the imagePullSecrets that workloads reference, with get
+  # (provider/kubernetes/implementer.go). With HELM3_PROVIDER="false" and no private
+  # registries, drop this rule; with private registries, get is enough.
   - apiGroups:
       - ""
     resources:
