@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"github.com/keel-hq/keel/types"
 	"regexp"
-	"sort"
 	"strings"
 )
 
@@ -48,14 +47,11 @@ func (p *RegexpPolicy) Filter(tags []string) []string {
 		}
 	}
 
-	sort.Slice(filtered, func(i, j int) bool {
+	sortTagsDesc(filtered, func(tag string) string {
 		if compare != -1 {
-			mi := p.regexp.FindStringSubmatch(filtered[i])
-			mj := p.regexp.FindStringSubmatch(filtered[j])
-			return mi[compare] > mj[compare]
-		} else {
-			return filtered[i] > filtered[j]
+			return p.regexp.FindStringSubmatch(tag)[compare]
 		}
+		return tag
 	})
 
 	return filtered

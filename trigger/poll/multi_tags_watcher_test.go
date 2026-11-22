@@ -211,6 +211,17 @@ func TestWatchRegexpTagsMixed(t *testing.T) {
 	testRunHelper(testCases, availableTags, t)
 }
 
+// A regexp that matches only long-term support releases (Forgejo: major version modulo 4 is 3) must pick
+// the highest of them by version, not by string: 15.0.12, not 15.0.9.
+func TestWatchRegexpTagsVersionOrder(t *testing.T) {
+	availableTags := []string{"13", "13.0.5", "15", "15.0.9", "15.0.10", "15.0.12", "16.0.7", "17.0.2", "latest"}
+	lts, _ := policy.NewRegexpPolicy(`regexp:^([37]|[0-9]*([02468][37]|[13579][159]))\.[0-9]+\.[0-9]+$`)
+	testRunHelper([]runTestCase{{"13", "15.0.12", lts}}, availableTags, t)
+
+	// already at the newest long-term support release: no event, in particular no move to 15.0.9
+	testRunHelper([]runTestCase{{"15.0.12", "15.0.12", lts}}, availableTags, t)
+}
+
 func TestWatchAllTagsMixedPolicyAll(t *testing.T) {
 	availableTags := []string{"1.3.0-dev", "1.5.0", "1.8.0-alpha"}
 	testCases := []runTestCase{
