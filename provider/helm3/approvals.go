@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/keel-hq/keel/internal/policy"
 	"github.com/keel-hq/keel/pkg/store"
 	"github.com/keel-hq/keel/types"
 
@@ -42,6 +43,25 @@ func (p *Provider) updateComplete(plan *UpdatePlan) error {
 
 func (p *Provider) isApproved(event *types.Event, plan *UpdatePlan) (bool, error) {
 	if plan.Config.Approvals == 0 {
+		return true, nil
+	}
+
+	required, err := policy.ApprovalRequired(plan.Config.ApprovalsFor, plan.CurrentVersion, plan.NewVersion)
+	if err != nil {
+		log.WithFields(log.Fields{
+			"error":        err,
+			"release_name": plan.Name,
+			"namespace":    plan.Namespace,
+		}).Warn("provider.helm3: failed to parse approvalsFor, asking for approvals on every update")
+	}
+	if !required {
+		log.WithFields(log.Fields{
+			"release_name": plan.Name,
+			"namespace":    plan.Namespace,
+			"approvalsFor": plan.Config.ApprovalsFor,
+			"previous":     plan.CurrentVersion,
+			"new":          plan.NewVersion,
+		}).Info("provider.helm3: update is below approvalsFor, applying it without approvals")
 		return true, nil
 	}
 
