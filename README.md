@@ -35,6 +35,9 @@ security (through dependency updates) and maintainability.
 
 - CI/CD
     - This project now utilizes GitHub Actions to builds and publish the `ghcr.io/markusressel/keel:latest` Docker container.
+- Approvals only for major (or major and minor) updates
+    - `keel.sh/approvalsFor` limits the approvals of `keel.sh/approvals` to the larger version changes, see
+      [Approvals only for larger updates](#approvals-only-for-larger-updates).
 
 ### Canged Features
 
@@ -143,6 +146,39 @@ spec:
 ```
 
 No additional configuration is required. Enabling continuous delivery for your workloads has never been this easy!
+
+### Approvals only for larger updates
+
+`keel.sh/approvals: "N"` asks for N approvals before every update. Add `keel.sh/approvalsFor` to ask only
+for the larger version changes and apply the smaller ones directly:
+
+```yaml
+  annotations:
+    keel.sh/policy: all
+    keel.sh/trigger: poll
+    keel.sh/approvals: "1"
+    keel.sh/approvalsFor: major
+```
+
+| `keel.sh/approvalsFor` | Approvals for                                    | Applied directly                      |
+|------------------------|--------------------------------------------------|---------------------------------------|
+| unset or `all`         | every update (the behaviour without the setting) | nothing                               |
+| `minor`                | major and minor changes                          | patch, fourth number, pre-release     |
+| `major`                | major changes                                    | minor, patch, fourth number, pre-release |
+
+- Keel compares the current and the new tag as versions: `X.Y`, `X.Y.Z` or `X.Y.Z.R`, with an optional `v`
+  prefix, pre-release and build metadata. `21.0.0.0 -> 21.0.0.1` and `1.2.5 -> 1.2.5.1` are below a patch change.
+- A downgrade counts like an upgrade of the same size, `2.0.0 -> 1.9.9` is a major change.
+- When either tag is not a version (`latest`, a bare number like `42`, build tags of a `glob:`, `regexp:` or
+  `force` policy), the size of the change is unknown, and Keel asks for approvals as without the setting.
+- A new digest of the same version tag (`1.2.3 -> 1.2.3`) is not a version change and is applied directly.
+  A new digest of `latest` still needs approvals.
+- An unknown value is logged as a warning and Keel asks for approvals on every update.
+- A direct update goes the same way as one with `keel.sh/approvals: "0"`: no approval request, and the usual
+  update notifications (for example the webhook notification "update resource" on success).
+- The setting has no effect without `keel.sh/approvals`. Like the other settings, it can be a label or an
+  annotation. For Helm charts, set `keel.approvalsFor` next to `keel.approvals` in the values.
+- Versions below 1.0.0 are not treated specially: `0.4.0 -> 0.5.0` is a minor change.
 
 ### (Official) Documentation
 

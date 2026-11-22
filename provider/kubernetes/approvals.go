@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/keel-hq/keel/internal/policy"
 	"github.com/keel-hq/keel/pkg/store"
 	"github.com/keel-hq/keel/types"
 
@@ -73,6 +74,14 @@ func getInt(key string, labels map[string]string, annotations map[string]string)
 	return 0, nil
 }
 
+// getString returns the value of key from the labels or, when no label has it, from the annotations.
+func getString(key string, labels map[string]string, annotations map[string]string) string {
+	if val, ok := labels[key]; ok {
+		return val
+	}
+	return annotations[key]
+}
+
 func (p *Provider) isApproved(event *types.Event, plan *UpdatePlan) (bool, error) {
 
 	minApprovals, err := getInt(types.KeelMinimumApprovalsLabel, plan.Resource.GetLabels(), plan.Resource.GetAnnotations())
@@ -81,6 +90,25 @@ func (p *Provider) isApproved(event *types.Event, plan *UpdatePlan) (bool, error
 	}
 
 	if minApprovals == 0 {
+		return true, nil
+	}
+
+	approvalsFor := getString(types.KeelApprovalsForLabel, plan.Resource.GetLabels(), plan.Resource.GetAnnotations())
+	required, err := policy.ApprovalRequired(approvalsFor, plan.CurrentVersion, plan.NewVersion)
+	if err != nil {
+		log.WithFields(log.Fields{
+			"error":    err,
+			"resource": plan.Resource.GetName(),
+		}).Warn("failed to parse approvalsFor, asking for approvals on every update")
+	}
+	if !required {
+		log.WithFields(log.Fields{
+			"resource":     plan.Resource.GetName(),
+			"namespace":    plan.Resource.Namespace,
+			"approvalsFor": approvalsFor,
+			"previous":     plan.CurrentVersion,
+			"new":          plan.NewVersion,
+		}).Info("provider.kubernetes: update is below approvalsFor, applying it without approvals")
 		return true, nil
 	}
 

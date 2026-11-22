@@ -163,6 +163,9 @@ type Manager interface {
 ```
 
 Set via `keel.sh/approvals: "2"` annotation to require N approvals.
+`keel.sh/approvalsFor: major` (or `minor`) limits these approvals to the larger version changes, see
+`internal/policy/approvals.go`. The check sits in `isApproved` of both providers, so an update below the
+limit takes the same path as one without approvals.
 
 ## Data Flow
 
@@ -182,6 +185,7 @@ Set via `keel.sh/approvals: "2"` annotation to require N approvals.
 | `keel.sh/pollSchedule` | Poll frequency | `@every 5m` |
 | `keel.sh/approvals` | Required approvals | `2` |
 | `keel.sh/approvalDeadline` | Approval timeout (hours) | `24` |
+| `keel.sh/approvalsFor` | Limit approvals to major (`major`) or major and minor (`minor`) version changes, smaller updates are applied directly; unset or `all` asks for every update | `major` |
 | `keel.sh/notify` | Override notification channel | `#deployments` |
 | `keel.sh/matchTag` | Force tag matching | `true` |
 | `keel.sh/matchPreRelease` | Match pre-release versions | `true` |

@@ -77,6 +77,11 @@ const KeelNotificationChanAnnotation = "keel.sh/notify"
 // KeelMinimumApprovalsLabel - min approvals
 const KeelMinimumApprovalsLabel = "keel.sh/approvals"
 
+// KeelApprovalsForLabel - limits the approvals of keel.sh/approvals to major
+// ("major") or major and minor ("minor") version changes, smaller updates are
+// applied without approvals. Unset or "all" asks for approvals on every update.
+const KeelApprovalsForLabel = "keel.sh/approvalsFor"
+
 // KeelUpdateTimeAnnotation - update time
 const KeelUpdateTimeAnnotation = "keel.sh/update-time"
 

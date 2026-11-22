@@ -150,6 +150,7 @@ type KeelChartConfig struct {
 	Trigger              types.TriggerType `json:"trigger"`
 	PollSchedule         string            `json:"pollSchedule"`
 	Approvals            int               `json:"approvals"`        // Minimum required approvals
+	ApprovalsFor         string            `json:"approvalsFor"`     // "major" or "minor": approvals only for these version changes, empty or "all" for every update
 	ApprovalDeadline     int               `json:"approvalDeadline"` // Deadline in hours
 	Images               []ImageDetails    `json:"images"`
 	NotificationChannels []string          `json:"notificationChannels"` // optional notification channels
