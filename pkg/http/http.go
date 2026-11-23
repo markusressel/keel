@@ -43,6 +43,9 @@ type Opts struct {
 
 	Store store.Store
 
+	// Poller runs the poll trigger on demand, nil when the poll trigger is disabled
+	Poller Poller
+
 	UIDir string
 	Debug bool
 
@@ -66,6 +69,7 @@ type TriggerServer struct {
 
 	store         store.Store
 	authenticator auth.Authenticator
+	poller        Poller
 
 	uiDir string
 	debug bool
@@ -87,6 +91,7 @@ func NewTriggerServer(opts *Opts) *TriggerServer {
 		router:                mux.NewRouter(),
 		authenticator:         opts.Authenticator,
 		store:                 opts.Store,
+		poller:                opts.Poller,
 		uiDir:                 opts.UIDir,
 		debug:                 opts.Debug,
 		authenticatedWebhooks: opts.AuthenticatedWebhooks,
@@ -173,6 +178,9 @@ func (s *TriggerServer) registerRoutes(mux *mux.Router) {
 		mux.HandleFunc("/v1/resources", s.requireAdminAuthorization(s.resourcesHandler)).Methods("GET", "OPTIONS")
 
 		mux.HandleFunc("/v1/policies", s.requireAdminAuthorization(s.policyUpdateHandler)).Methods("PUT", "OPTIONS")
+
+		// check registries now instead of waiting for the poll schedule
+		mux.HandleFunc("/v1/poll", s.requireAdminAuthorization(s.pollHandler)).Methods("POST", "OPTIONS")
 
 		// tracked images
 		mux.HandleFunc("/v1/tracked", s.requireAdminAuthorization(s.trackedHandler)).Methods("GET", "OPTIONS")

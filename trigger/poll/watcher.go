@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/keel-hq/keel/util/image"
 
@@ -52,6 +54,12 @@ type watchDetails struct {
 	latest       string // latest tag
 	schedule     string
 	mu           sync.RWMutex
+
+	// runMu serializes runs of the job, so a scheduled run and an on-demand
+	// poll of the same image never compare and update the state at once
+	runMu sync.Mutex
+	// job is the check the cron entry runs, kept for on-demand polls
+	job pollJob
 }
 
 // RepositoryWatcher - repository watcher cron
@@ -64,8 +72,19 @@ type RepositoryWatcher struct {
 	// internal map of internal watches
 	// map[registry/name]=image.Reference
 	watched map[string]*watchDetails
+	// watchedMu guards writes to watched and reads from outside the manager
+	// goroutine, which is the only writer
+	watchedMu sync.RWMutex
+
+	// pollAllRunning is set while an on-demand poll of every image runs
+	pollAllRunning atomic.Bool
 
 	cron *cron.Cron
+
+	// limits of on-demand polls
+	pollImageTimeout time.Duration
+	pollTotalTimeout time.Duration
+	pollConcurrency  int
 }
 
 // NewRepositoryWatcher - create new repository watcher
@@ -77,6 +96,10 @@ func NewRepositoryWatcher(providers provider.Providers, registryClient registry.
 		registryClient: registryClient,
 		watched:        make(map[string]*watchDetails),
 		cron:           c,
+
+		pollImageTimeout: DefaultPollImageTimeout,
+		pollTotalTimeout: DefaultPollTotalTimeout,
+		pollConcurrency:  DefaultPollConcurrency,
 	}
 }
 
@@ -104,7 +127,9 @@ func (w *RepositoryWatcher) Unwatch(imageIdentifier string) error {
 	_, ok := w.watched[imageIdentifier]
 	if ok {
 		w.cron.DeleteJob(imageIdentifier)
+		w.watchedMu.Lock()
 		delete(w.watched, imageIdentifier)
+		w.watchedMu.Unlock()
 	}
 	return nil
 }
@@ -163,7 +188,9 @@ func (w *RepositoryWatcher) unwatch(tracked map[string]bool) {
 				"schedule": details.schedule,
 			}).Info("trigger.poll.RepositoryWatcher: image no longer tracked, removing watcher")
 			w.cron.DeleteJob(key)
+			w.watchedMu.Lock()
 			delete(w.watched, key)
+			w.watchedMu.Unlock()
 		}
 	}
 }
@@ -272,6 +299,14 @@ func matchesAny(digests []string, known map[string]bool) bool {
 	return false
 }
 
+// addWatched adds the details and their job to the internal map
+func (w *RepositoryWatcher) addWatched(key string, details *watchDetails, job pollJob) {
+	details.job = job
+	w.watchedMu.Lock()
+	w.watched[key] = details
+	w.watchedMu.Unlock()
+}
+
 func (w *RepositoryWatcher) addJob(ti *types.TrackedImage, schedule string, runningDigests [][]string) error {
 	// getting initial digest
 	reg := ti.Image.Scheme() + "://" + ti.Image.Registry()
@@ -324,14 +359,12 @@ func (w *RepositoryWatcher) addJob(ti *types.TrackedImage, schedule string, runn
 		schedule:     schedule,
 	}
 
-	// adding job to internal map
-	w.watched[key] = details
-
 	// read the docs several times, the only legit case when want a tag watcher
 	// is when policy is force and keel.sh/match-tag=true.
 	if ti.Policy.KeepTag() {
 		// adding new job
 		job := NewWatchTagJob(w.providers, w.registryClient, details)
+		w.addWatched(key, details, job)
 		log.WithFields(log.Fields{
 			"job_name": key,
 			"image":    ti.Image.String(),
@@ -346,6 +379,7 @@ func (w *RepositoryWatcher) addJob(ti *types.TrackedImage, schedule string, runn
 
 	// adding new job
 	job := NewWatchRepositoryTagsJob(w.providers, w.registryClient, details)
+	w.addWatched(key, details, job)
 	log.WithFields(log.Fields{
 		"job_name": key,
 		"image":    ti.Image.Registry() + "/" + ti.Image.ShortName(), // A watcher can be shared, so it makes little sense to specify tag depth here

@@ -28,6 +28,15 @@ func NewWatchTagJob(providers provider.Providers, registryClient registry.Client
 
 // Run - main function to check schedule
 func (j *WatchTagJob) Run() {
+	j.check()
+}
+
+// check compares the tag's registry digest with the last known one and
+// submits an event when it changed. Scheduled and on-demand polls both run it.
+func (j *WatchTagJob) check() pollOutcome {
+	j.details.runMu.Lock()
+	defer j.details.runMu.Unlock()
+
 	reg := j.details.trackedImage.Image.Scheme() + "://" + j.details.trackedImage.Image.Registry()
 	registryOpts := registry.Opts{
 		Registry: reg,
@@ -50,7 +59,7 @@ func (j *WatchTagJob) Run() {
 			"error": err,
 			"image": j.details.trackedImage.Image.String(),
 		}).Error("trigger.poll.WatchTagJob: failed to check digest")
-		return
+		return pollOutcome{err: err}
 	}
 
 	log.WithFields(log.Fields{
@@ -86,7 +95,10 @@ func (j *WatchTagJob) Run() {
 				"digest":     currentDigest,
 				"error":      err,
 			}).Error("trigger.poll.WatchRepositoryTagsJob: error while submitting an event")
+			return pollOutcome{tag: currentDigest, err: err}
 		}
-
+		return pollOutcome{submitted: true, tag: currentDigest}
 	}
+
+	return pollOutcome{tag: currentDigest}
 }
