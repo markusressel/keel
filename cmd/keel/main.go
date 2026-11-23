@@ -374,6 +374,14 @@ func setupTriggers(ctx context.Context, opts *TriggerOpts) (teardown func()) {
 		Secret:   []byte(opts.appConfig.Auth.TokenSecret),
 	})
 
+	// the poll watcher is created before the HTTP server, which runs it on demand
+	var watcher *poll.RepositoryWatcher
+	var poller http.Poller
+	if opts.appConfig.Trigger.Poll {
+		watcher = poll.NewRepositoryWatcher(opts.providers, registry.New())
+		poller = watcher
+	}
+
 	// setting up generic http webhook server
 	whs := http.NewTriggerServer(&http.Opts{
 		Port:                  types.KeelDefaultPort,
@@ -382,6 +390,7 @@ func setupTriggers(ctx context.Context, opts *TriggerOpts) (teardown func()) {
 		Providers:             opts.providers,
 		ApprovalManager:       opts.approvalsManager,
 		Store:                 opts.store,
+		Poller:                poller,
 		Authenticator:         authenticator,
 		UIDir:                 opts.uiDir,
 		Debug:                 opts.appConfig.Debug,
@@ -432,10 +441,7 @@ func setupTriggers(ctx context.Context, opts *TriggerOpts) (teardown func()) {
 		go subManager.Start(ctx)
 	}
 
-	if opts.appConfig.Trigger.Poll {
-
-		registryClient := registry.New()
-		watcher := poll.NewRepositoryWatcher(opts.providers, registryClient)
+	if watcher != nil {
 		pollManager := poll.NewPollManager(opts.providers, watcher, opts.appConfig.Trigger.PollScanInterval)
 
 		// start poll manager, will finish with ctx

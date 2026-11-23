@@ -16,6 +16,9 @@ import ApiClient from "../ApiClient";
 import PkgHttpAPIResponse from '../model/PkgHttpAPIResponse';
 import PkgHttpApproveRequest from '../model/PkgHttpApproveRequest';
 import PkgHttpAuditLogsResponse from '../model/PkgHttpAuditLogsResponse';
+import PkgHttpPollErrorResponse from '../model/PkgHttpPollErrorResponse';
+import PkgHttpPollRequest from '../model/PkgHttpPollRequest';
+import PkgHttpPollResponse from '../model/PkgHttpPollResponse';
 import PkgHttpResourceApprovalsUpdateRequest from '../model/PkgHttpResourceApprovalsUpdateRequest';
 import PkgHttpResourcePolicyUpdateRequest from '../model/PkgHttpResourcePolicyUpdateRequest';
 import PkgHttpResourceResponse from '../model/PkgHttpResourceResponse';
@@ -258,6 +261,52 @@ export default class AdminApi {
      */
     listTrackedImages() {
       return this.listTrackedImagesWithHttpInfo()
+        .then(function(response_and_data) {
+          return response_and_data.data;
+        });
+    }
+
+
+    /**
+     * Poll registries now
+     * Runs the poll trigger's check for the selected images right away, the same check as a scheduled poll, so policies, approvals and notifications behave the same. Select images with either identifier (a resource from GET /v1/resources) or image (a repository, with or without tag); an empty body polls every watched image. Images are checked with limited concurrency, each bounded by a per-image timeout and the whole request by a total timeout. submitted is true when the poll found a newer image and submitted an event to the providers. tag is the newest tag (or digest, for keel.sh/matchTag watchers) the poll saw; when nothing is newer it is the current tag. A poll of every image is refused with 429 while a previous one is still running. This route exists only when the authenticator is enabled.
+     * @param {Object} opts Optional parameters
+     * @param {module:model/PkgHttpPollRequest} [body] Images to poll
+     * @return {Promise} a {@link https://www.promisejs.org/|Promise}, with an object containing data of type {@link module:model/PkgHttpPollResponse} and HTTP response
+     */
+    pollNowWithHttpInfo(opts) {
+      opts = opts || {};
+      let postBody = opts['body'];
+
+      let pathParams = {
+      };
+      let queryParams = {
+      };
+      let headerParams = {
+      };
+      let formParams = {
+      };
+
+      let authNames = ['BasicAuth', 'BearerAuth'];
+      let contentTypes = ['application/json'];
+      let accepts = ['application/json'];
+      let returnType = PkgHttpPollResponse;
+      return this.apiClient.callApi(
+        '/v1/poll', 'POST',
+        pathParams, queryParams, headerParams, formParams, postBody,
+        authNames, contentTypes, accepts, returnType, null
+      );
+    }
+
+    /**
+     * Poll registries now
+     * Runs the poll trigger's check for the selected images right away, the same check as a scheduled poll, so policies, approvals and notifications behave the same. Select images with either identifier (a resource from GET /v1/resources) or image (a repository, with or without tag); an empty body polls every watched image. Images are checked with limited concurrency, each bounded by a per-image timeout and the whole request by a total timeout. submitted is true when the poll found a newer image and submitted an event to the providers. tag is the newest tag (or digest, for keel.sh/matchTag watchers) the poll saw; when nothing is newer it is the current tag. A poll of every image is refused with 429 while a previous one is still running. This route exists only when the authenticator is enabled.
+     * @param {Object} opts Optional parameters
+     * @param {module:model/PkgHttpPollRequest} opts.body Images to poll
+     * @return {Promise} a {@link https://www.promisejs.org/|Promise}, with data of type {@link module:model/PkgHttpPollResponse}
+     */
+    pollNow(opts) {
+      return this.pollNowWithHttpInfo(opts)
         .then(function(response_and_data) {
           return response_and_data.data;
         });

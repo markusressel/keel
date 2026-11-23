@@ -12,15 +12,18 @@ type Credentials struct {
 
 // TrackedImage - tracked image data+metadata
 type TrackedImage struct {
-	Image        *image.Reference  `json:"image"`
-	Trigger      TriggerType       `json:"trigger"`
-	PollSchedule string            `json:"pollSchedule"`
-	Provider     string            `json:"provider"`
-	Namespace    string            `json:"namespace"`
-	Secrets      []string          `json:"secrets"`
-	Meta         map[string]string `json:"meta"` // metadata supplied by providers
-	Platforms    []Platform        `json:"-"`
-	PlatformErr  PlatformError     `json:"-"`
+	Image        *image.Reference `json:"image"`
+	Trigger      TriggerType      `json:"trigger"`
+	PollSchedule string           `json:"pollSchedule"`
+	Provider     string           `json:"provider"`
+	Namespace    string           `json:"namespace"`
+	// Identifier of the resource using the image (<kind>/<namespace>/<name>),
+	// empty when the provider has no such identifier
+	Identifier  string            `json:"identifier,omitempty"`
+	Secrets     []string          `json:"secrets"`
+	Meta        map[string]string `json:"meta"` // metadata supplied by providers
+	Platforms   []Platform        `json:"-"`
+	PlatformErr PlatformError     `json:"-"`
 	// RunningDigests are the image digests reported by the workload runtime for
 	// this image reference. Empty when the provider cannot observe them.
 	RunningDigests []string `json:"-"`

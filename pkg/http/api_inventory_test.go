@@ -33,6 +33,7 @@ var documentedAPIOperations = []apiOperation{
 	{http.MethodPut, "/v1/approvals", "setResourceApprovals"},
 	{http.MethodGet, "/v1/resources", "listResources"},
 	{http.MethodPut, "/v1/policies", "updateResourcePolicy"},
+	{http.MethodPost, "/v1/poll", "pollNow"},
 	{http.MethodGet, "/v1/tracked", "listTrackedImages"},
 	{http.MethodPut, "/v1/tracked", "updateTrackedImage"},
 	{http.MethodGet, "/v1/audit", "listAuditLogs"},

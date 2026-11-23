@@ -1,6 +1,9 @@
 package poll
 
 import (
+	"fmt"
+	"strings"
+
 	"github.com/keel-hq/keel/extension/credentialshelper"
 	"github.com/keel-hq/keel/provider"
 	"github.com/keel-hq/keel/registry"
@@ -32,6 +35,15 @@ func NewWatchRepositoryTagsJob(providers provider.Providers, registryClient regi
 
 // Run - main function to check schedule
 func (j *WatchRepositoryTagsJob) Run() {
+	j.check()
+}
+
+// check lists the repository's tags and submits an event for every related
+// workload that has a newer tag. Scheduled and on-demand polls both run it.
+func (j *WatchRepositoryTagsJob) check() pollOutcome {
+	j.details.runMu.Lock()
+	defer j.details.runMu.Unlock()
+
 	j.details.mu.RLock()
 	defer j.details.mu.RUnlock()
 
@@ -60,7 +72,7 @@ func (j *WatchRepositoryTagsJob) Run() {
 			"registry_url": reg,
 			"image":        j.details.trackedImage.Image.String(),
 		}).Error("trigger.poll.WatchRepositoryTagsJob: failed to get repository")
-		return
+		return pollOutcome{err: err}
 	}
 
 	registriesScannedCounter.With(prometheus.Labels{"registry": j.details.trackedImage.Image.Registry(), "image": j.details.trackedImage.Image.Repository()}).Inc()
@@ -71,15 +83,15 @@ func (j *WatchRepositoryTagsJob) Run() {
 		"image_name":      j.details.trackedImage.Image.Remote(),
 	}).Debug("trigger.poll.WatchRepositoryTagsJob: checking tags")
 
-	err = j.processTags(repository.Tags)
-	if err != nil {
+	outcome := j.processTags(repository.Tags)
+	if outcome.err != nil && !outcome.submitted {
 		log.WithFields(log.Fields{
-			"error":           err,
+			"error":           outcome.err,
 			"repository_tags": repository.Tags,
 			"image":           j.details.trackedImage.Image.String(),
 		}).Error("trigger.poll.WatchRepositoryTagsJob: failed to process tags")
-		return
 	}
+	return outcome
 }
 
 // getRepository lists the repository's tags. When every workload sharing this
@@ -306,13 +318,21 @@ func getRelatedTrackedImages(ours *types.TrackedImage, all []*types.TrackedImage
 	return b
 }
 
-func (j *WatchRepositoryTagsJob) processTags(tags []string) error {
+// processTags submits an event per newer tag. The outcome's tag is the first
+// submitted tag, or the tracked image's current tag when nothing is newer.
+func (j *WatchRepositoryTagsJob) processTags(tags []string) pollOutcome {
 
 	events, err := j.computeEvents(tags)
 	if err != nil {
-		return err
+		return pollOutcome{err: err}
 	}
-	for _, e := range events {
+
+	outcome := pollOutcome{tag: j.details.trackedImage.Image.Tag()}
+	var submitErrs []string
+	for i, e := range events {
+		if i == 0 {
+			outcome.tag = e.Repository.Tag
+		}
 		err = j.providers.Submit(e)
 		if err != nil {
 			log.WithFields(log.Fields{
@@ -320,7 +340,13 @@ func (j *WatchRepositoryTagsJob) processTags(tags []string) error {
 				"new_tag":    e.Repository.Tag,
 				"error":      err,
 			}).Error("trigger.poll.WatchRepositoryTagsJob: error while submitting an event")
+			submitErrs = append(submitErrs, fmt.Sprintf("%s: %s", e.Repository.Tag, err))
+			continue
 		}
+		outcome.submitted = true
 	}
-	return nil
+	if len(submitErrs) > 0 {
+		outcome.err = fmt.Errorf("failed to submit event(s): %s", strings.Join(submitErrs, ", "))
+	}
+	return outcome
 }

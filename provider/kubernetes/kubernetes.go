@@ -451,6 +451,7 @@ func (p *Provider) TrackedImages() ([]*types.TrackedImage, error) {
 				Trigger:        trigger,
 				Provider:       ProviderName,
 				Namespace:      gr.Namespace,
+				Identifier:     gr.Identifier,
 				Secrets:        secrets,
 				Meta:           make(map[string]string),
 				Platforms:      platforms,

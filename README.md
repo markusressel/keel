@@ -38,11 +38,15 @@ security (through dependency updates) and maintainability.
 - Approvals only for major (or major and minor) updates
     - `keel.sh/approvalsFor` limits the approvals of `keel.sh/approvals` to the larger version changes, see
       [Approvals only for larger updates](#approvals-only-for-larger-updates).
+- Poll on demand
+    - `POST /v1/poll` checks the registries right away instead of waiting for `keel.sh/pollSchedule`, see
+      [Poll on demand](#poll-on-demand).
 
 ### Canged Features
 
 - API
-    - The REST API of the original project is currently unchanged, but might be extended in the future.
+    - The REST API of the original project is extended (for example by `POST /v1/poll`), existing endpoints are
+      unchanged. All endpoints are described in [docs/swagger.yaml](docs/swagger.yaml).
     - Since I do not intend to support a ton of external services like Slack or Discord, this API is the main
       way to interact with Keel and come up with your own service to provide bots and notifications. If you
       would like to create such a service, take a look at the [keel-telegram-bot](https://github.com/markusressel/keel-telegram-bot) project.
@@ -179,6 +183,52 @@ for the larger version changes and apply the smaller ones directly:
 - The setting has no effect without `keel.sh/approvals`. Like the other settings, it can be a label or an
   annotation. For Helm charts, set `keel.approvalsFor` next to `keel.approvals` in the values.
 - Versions below 1.0.0 are not treated specially: `0.4.0 -> 0.5.0` is a minor change.
+
+### Poll on demand
+
+The poll trigger checks each image on its `keel.sh/pollSchedule`. `POST /v1/poll` runs that check right away,
+for example from a bot. It needs the same authentication as the other `/v1` endpoints (basic auth or a token)
+and exists only when authentication is enabled.
+
+```shell
+# every image of one resource, the identifier as returned by GET /v1/resources
+curl -u admin:password -X POST http://keel:9300/v1/poll -d '{"identifier": "deployment/default/wd"}'
+# one image repository, with or without tag; docker.io short forms like nginx work too
+curl -u admin:password -X POST http://keel:9300/v1/poll -d '{"image": "ghcr.io/music-assistant/server"}'
+# every image the poll trigger watches
+curl -u admin:password -X POST http://keel:9300/v1/poll
+```
+
+Set `identifier` or `image`, not both; an empty body or `{}` polls every watched image. The response lists one
+result per watched image:
+
+```json
+{"results": [{"image": "ghcr.io/music-assistant/server", "submitted": true, "tag": "2.5.0", "error": ""}]}
+```
+
+- `image` is the image as the poll trigger watches it: `registry/name`, plus `:tag` for `force` policies with
+  `keel.sh/matchTag`, which watch one tag. Docker Hub images show as `index.docker.io/library/nginx`.
+- `submitted` is true when the poll found a newer image and handed it to Keel. Whether that updates the workload
+  directly or creates an approval request follows the usual settings.
+- `tag` is the newest tag the poll saw (the current tag when nothing is newer), or the digest for watchers of one tag.
+- `error` is empty when the check worked, otherwise the registry error, a timeout, or `not watched by the poll trigger`
+  for an image of the resource that has no watcher yet.
+
+The check is the one the schedule runs, so policies, `keel.sh/matchTag`, `keel.sh/approvals`,
+`keel.sh/approvalsFor` and notifications behave as on a scheduled poll. The request waits for the checks: four images
+at a time, each for up to 30 seconds, the whole request up to 60 seconds. Images not checked by then report an error.
+A check that runs into its timeout carries on in the background.
+
+| Status | When |
+|--------|------|
+| 200 | checks done, see `results` |
+| 400 | invalid JSON, an unknown field, or both `identifier` and `image` set |
+| 401 | not authenticated |
+| 404 | the resource or image is not watched by the poll trigger |
+| 429 | a poll of every image was requested while the previous one still runs |
+| 503 | the poll trigger is disabled (`POLL=false`) |
+
+Error responses are JSON: `{"error": "..."}`.
 
 ### (Official) Documentation
 

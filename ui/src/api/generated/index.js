@@ -40,6 +40,10 @@ import PkgHttpJFrogPlatform from './model/PkgHttpJFrogPlatform';
 import PkgHttpJFrogWebhook from './model/PkgHttpJFrogWebhook';
 import PkgHttpJFrogWebhookData from './model/PkgHttpJFrogWebhookData';
 import PkgHttpLoginRequest from './model/PkgHttpLoginRequest';
+import PkgHttpPollErrorResponse from './model/PkgHttpPollErrorResponse';
+import PkgHttpPollRequest from './model/PkgHttpPollRequest';
+import PkgHttpPollResponse from './model/PkgHttpPollResponse';
+import PkgHttpPollResult from './model/PkgHttpPollResult';
 import PkgHttpQuayWebhook from './model/PkgHttpQuayWebhook';
 import PkgHttpRegistryActor from './model/PkgHttpRegistryActor';
 import PkgHttpRegistryEvent from './model/PkgHttpRegistryEvent';
@@ -265,6 +269,30 @@ export {
      * @property {module:model/PkgHttpLoginRequest}
      */
     PkgHttpLoginRequest,
+
+    /**
+     * The PkgHttpPollErrorResponse model constructor.
+     * @property {module:model/PkgHttpPollErrorResponse}
+     */
+    PkgHttpPollErrorResponse,
+
+    /**
+     * The PkgHttpPollRequest model constructor.
+     * @property {module:model/PkgHttpPollRequest}
+     */
+    PkgHttpPollRequest,
+
+    /**
+     * The PkgHttpPollResponse model constructor.
+     * @property {module:model/PkgHttpPollResponse}
+     */
+    PkgHttpPollResponse,
+
+    /**
+     * The PkgHttpPollResult model constructor.
+     * @property {module:model/PkgHttpPollResult}
+     */
+    PkgHttpPollResult,
 
     /**
      * The PkgHttpQuayWebhook model constructor.
